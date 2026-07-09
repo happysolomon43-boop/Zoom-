@@ -444,7 +444,6 @@ async function upsertStandingHistory(standing, competitionId, seasonIndex) {
       goals_for:      standing.goalsFor,
       goals_against:  standing.goalsAgainst,
       form:           standing.form ?? [],
-      updated_at:     new Date().toISOString(),
     }, { onConflict: 'competition_id,team_id,season_index' });
   if (error) throw new Error(`upsertStandingHistory(${standing.competitorId}, s${seasonIndex}): ${error.message}`);
 }
@@ -746,7 +745,7 @@ async function archiveSeasonForComp(competitionId, compName, fromSeason, toSeaso
 
   const { error: updStErr } = await supabase
     .from('standings_history')
-    .update({ season_index: toSeason, updated_at: new Date().toISOString() })
+    .update({ season_index: toSeason })
     .eq('competition_id', competitionId)
     .eq('season_index', fromSeason);
   if (updStErr) throw new Error(`archiveSeasonForComp upd standings_history: ${updStErr.message}`);
