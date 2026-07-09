@@ -243,9 +243,18 @@ async function fetchAllResults(competitionId, previous = 0) {
  * Fetches the most recent N rounds for a competition (no pagination).
  * Used for the stats sweep to avoid re-fetching the entire history.
  */
-async function fetchRecentRounds(competitionId, limit = STATS_SWEEP_ROUNDS) {
+// BUG FIX: previous used to be hardcoded to 0 (current season) with no way
+// to ask for the previous season's recent rounds. scrapeResults' rollover
+// probe (below) needs previous=1 data to sample against season_index=1 in
+// the DB — with the old hardcoded 0 it was silently sampling CURRENT-season
+// match ids instead. Those ids essentially never exist in season_index=1,
+// so once season_index=1 had ≥50 rows the rollover check false-positived
+// on almost every single routine cycle, archiving season 1 → 2 repeatedly
+// and leaving season_index=1 permanently empty (it's only repopulated on a
+// fullSync). Making `previous` an explicit parameter fixes the call site.
+async function fetchRecentRounds(competitionId, limit = STATS_SWEEP_ROUNDS, previous = 0) {
   const data = await zoomGet(
-    `/SeasonResult/Results?clientId=${CLIENT_ID}&competitionId=${competitionId}&previous=0&offset=0&limit=${limit}`
+    `/SeasonResult/Results?clientId=${CLIENT_ID}&competitionId=${competitionId}&previous=${previous}&offset=0&limit=${limit}`
   );
   return data?.rounds ?? [];
 }
@@ -800,7 +809,10 @@ async function scrapeResults(competitions, fullSync = false) {
       // data doesn't change between rollovers, so we don't need to write it
       // every 5 minutes; we only need to detect when a new rollover occurs.
       const prevRounds = fullSync ? await fetchAllResults(comp.id, 1) : [];
-      const probeRounds = fullSync ? prevRounds : await fetchRecentRounds(comp.id, 3);
+      // previous=1 explicitly — this probe exists purely to sample recent
+      // PREVIOUS-season match ids for rollover detection against
+      // season_index=1 in the DB (see fetchRecentRounds fix above).
+      const probeRounds = fullSync ? prevRounds : await fetchRecentRounds(comp.id, 3, 1);
 
       if (probeRounds.length > 0) {
         // Rollover detection: sample incoming match IDs against the DB.
@@ -843,6 +855,13 @@ async function scrapeResults(competitions, fullSync = false) {
           // Archive season_index=1 → season_index=2 NOW before overwriting.
           console.log(`[scraper] Season rollover detected for ${comp.name} — archiving 1 → 2.`);
           await archiveSeasonForComp(comp.id, comp.name, 1, 2);
+          // Season 0's round numbering restarts near 1 once the new season
+          // begins. Reset the high-water mark so the "only write rounds
+          // newer than the last known max" optimization below doesn't treat
+          // every round of the brand-new season as "already seen" and skip
+          // writing all of them (they'd all have round ids lower than the
+          // old max round from the season that just ended).
+          allTimeMaxRound.set(comp.id, 0);
         }
 
         if (fullSync) {
@@ -866,9 +885,36 @@ async function scrapeResults(competitions, fullSync = false) {
       }
 
       // ── Current season (previous=0 → season_index 0) ──────────────────
+      // Pagination itself (fetchAllResults) still has to walk the full
+      // history every cycle, since the Zoom API's sort order for this
+      // endpoint is unconfirmed (see fetchRecentRounds) and we can't safely
+      // assume the newest rounds are on any particular page.
       const currRounds = await fetchAllResults(comp.id, 0);
 
-      for (const round of currRounds) {
+      // BUG 1B FIX: previously every round of the current season was
+      // re-upserted on every 5-minute slow-cycle tick, for all 9 leagues,
+      // with one Supabase await per match/goal/H2H write. As a league's
+      // round count grew into the hundreds, that write volume made the
+      // cycle take 40+ minutes — permanently blocking every later tick via
+      // slowInFlight (leagues never update more than ~once/hour). Completed
+      // rounds never change after the fact, so on routine cycles we only
+      // need to write rounds newer than the highest round_id we've already
+      // stored for this competition. fullSync (startup) still writes
+      // everything, since the DB may be empty. Trade-off: if the API ever
+      // silently corrects an already-written round's score, that
+      // correction won't be picked up until the next fullSync/restart.
+      // A small buffer of already-seen rounds is re-written every cycle too
+      // (not just brand-new ones), so a late correction the API makes to a
+      // just-completed round's score/goalscorers/corners after we first
+      // wrote it still gets picked up on the very next tick, instead of
+      // waiting for a full restart.
+      const REWRITE_BUFFER_ROUNDS = 2;
+      const knownMaxRound = allTimeMaxRound.get(comp.id) ?? 0;
+      const roundsToWrite = fullSync
+        ? currRounds
+        : currRounds.filter(round => round.id > knownMaxRound - REWRITE_BUFFER_ROUNDS);
+
+      for (const round of roundsToWrite) {
         for (const match of round.matches ?? []) {
           await upsertMatch(match, comp.id, round.id, round.time, 0);
           await upsertGoalEvents(match.matchId, match.goalscorersHome, 'home');
@@ -886,10 +932,14 @@ async function scrapeResults(competitions, fullSync = false) {
       }
 
       if (currRounds.length > 0) {
-        const latestRoundId = currRounds[0].id;
-        const prevMax       = allTimeMaxRound.get(comp.id) ?? 0;
-        if (latestRoundId > prevMax) allTimeMaxRound.set(comp.id, latestRoundId);
-        console.log(`[scraper] ${comp.name} season 0: ${currRounds.length} rounds scraped.`);
+        // Don't assume position in the array reflects recency (sort order
+        // is unconfirmed) — take the max round id across everything fetched.
+        const latestRoundId = Math.max(...currRounds.map(r => r.id));
+        if (latestRoundId > knownMaxRound) allTimeMaxRound.set(comp.id, latestRoundId);
+        console.log(
+          `[scraper] ${comp.name} season 0: ${currRounds.length} rounds fetched, ` +
+          `${roundsToWrite.length} new round(s) written.`
+        );
       }
 
     } catch (err) {
@@ -1128,11 +1178,13 @@ async function scrapeLive(competitions) {
   const seenMatchIds = new Set();
 
   for (const comp of competitions) {
-    // comp.liveRound comes from /Competition/Init — it's 0 / null when no
-    // round is currently running for this competition, so we can skip the
-    // API call entirely and save 9 requests per cycle when nothing is live.
-    if (!comp.liveRound) continue;
-
+    // BUG 2B FIX: do NOT gate on comp.liveRound here — see the function
+    // docstring above. A previous edit reintroduced this exact check even
+    // though the docstring right above it explains why it was removed
+    // (liveRound is stale/unreliable and made the Live tab look empty while
+    // rounds were genuinely in progress). fetchLiveResults()'s null/empty
+    // result is the real source of truth, so every competition is checked
+    // every fast cycle unconditionally.
     try {
       const liveData = await fetchLiveResults(comp.id);
       if (!liveData) continue;
@@ -1262,7 +1314,12 @@ async function runFastCycle() {
 async function selfPing() {
   if (!SELF_PING_URL) return; // no public URL known (local dev, non-Render host) — nothing to do
   try {
-    const res = await fetch(`${SELF_PING_URL}/healthz`);
+    // Use the same bounded timeout as the Zoom API calls — an unbounded
+    // fetch() here can't block a scrape cycle (self-ping isn't guarded by
+    // slowInFlight/fastInFlight), but a hung request would still never
+    // resolve and would quietly pile up one dangling connection per missed
+    // 8-minute tick forever.
+    const res = await fetchWithTimeout(`${SELF_PING_URL}/healthz`);
     console.log(`[keepalive] Self-ping ${res.status} at ${new Date().toISOString()}`);
   } catch (err) {
     console.error(`[keepalive] Self-ping failed: ${err.message}`);
