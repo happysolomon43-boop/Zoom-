@@ -894,27 +894,69 @@ async function syncStandings(competitions) {
   let totalRows = 0;
 
   for (const comp of competitions) {
+    // ── Current season → standings table ────────────────────────────────
+    // Kept in its own try/catch so a transient failure or empty response
+    // for the current season never blocks the history write below.
+    // We track whether the fetch succeeded so the similarity guard below
+    // can be skipped safely when currPlayedTotal is unreliable.
+    let currPlayedTotal = 0;
+    let currStandingsFetched = false;
     try {
-      // ── Current season → standings table ────────────────────────────────
       const currRows = await fetchStandings(comp.id);
-      if (!currRows || currRows.length === 0) continue;
-      const currPlayedTotal = currRows.reduce((s, r) => s + (r.played ?? 0), 0);
-
-      for (const row of currRows) {
-        await upsertStanding(row, comp.id);
-        totalRows++;
+      if (currRows && currRows.length > 0) {
+        currPlayedTotal       = currRows.reduce((s, r) => s + (r.played ?? 0), 0);
+        currStandingsFetched  = true;
+        for (const row of currRows) {
+          await upsertStanding(row, comp.id);
+          totalRows++;
+        }
       }
+    } catch (err) {
+      console.error(`[scraper] Standings error (comp ${comp.id}): ${err.message}`);
+    }
 
-      // ── Previous season → standings_history(1) ───────────────────────────
-      try {
-        const prevRows = await fetchStandingsForSeason(comp.id, 1);
-        if (!prevRows || prevRows.length === 0) continue;
+    // ── Previous season → standings_history(1) ───────────────────────────
+    // Runs independently of the block above so leagues whose new season
+    // has just started (empty current standings) still get their history.
+    //
+    // syncStandings intentionally runs BEFORE scrapeResults each cycle so
+    // standings_history(1) is captured before a potential 1→2 archive on
+    // season rollover. The cold-start trade-off: history is one slow cycle
+    // behind the first match write — acceptable, since the next 5-min tick
+    // will populate it once scrapeResults has seeded season_index=1 matches.
+    try {
+      const prevRows = await fetchStandingsForSeason(comp.id, 1);
+      if (!prevRows || prevRows.length === 0) continue;
 
-        const prevPlayedTotal = prevRows.reduce((s, r) => s + (r.played ?? 0), 0);
+      const prevPlayedTotal = prevRows.reduce((s, r) => s + (r.played ?? 0), 0);
 
-        // Guard: skip if the API returned identical data to current season.
-        if (prevPlayedTotal > 0 && currPlayedTotal > 0 &&
-            Math.abs(prevPlayedTotal - currPlayedTotal) / currPlayedTotal < 0.05) {
+      // Guard: skip if the API returned identical data to the current season.
+      // Some league APIs (including Zoom-branded variants) ignore the
+      // `previous` parameter and always return current-season data — writing
+      // that into standings_history would corrupt the Previous season tab.
+      if (currStandingsFetched && prevPlayedTotal > 0 && currPlayedTotal > 0 &&
+          Math.abs(prevPlayedTotal - currPlayedTotal) / currPlayedTotal < 0.05) {
+
+        // Query both history and confirmed season-1 match count in parallel.
+        const [histResult, s1Result] = await Promise.all([
+          supabase
+            .from('standings_history')
+            .select('competition_id', { count: 'exact', head: true })
+            .eq('competition_id', comp.id)
+            .eq('season_index', 1),
+          supabase
+            .from('matches')
+            .select('match_id', { count: 'exact', head: true })
+            .eq('competition_id', comp.id)
+            .eq('season_index', 1),
+        ]);
+
+        const histCount   = histResult.count ?? 0;
+        const s1MatchCount = s1Result.count  ?? 0;
+
+        if (histCount > 0) {
+          // History already populated and played totals look like same-season
+          // data — preserving existing history, skipping overwrite.
           console.warn(
             `[scraper] ${comp.name} previous standings look same as current ` +
             `(played ${prevPlayedTotal} vs ${currPlayedTotal}) — skipping history write.`
@@ -922,23 +964,37 @@ async function syncStandings(competitions) {
           continue;
         }
 
-        for (const row of prevRows) {
-          await upsertStandingHistory(row, comp.id, 1);
-          totalRows++;
+        if (s1MatchCount < 50) {
+          // No history yet AND not enough season_index=1 matches to confirm a
+          // real previous season. scrapeResults will write the matches this
+          // cycle; the next slow cycle will have the evidence needed.
+          console.info(
+            `[scraper] ${comp.name} season 1 history deferred — ` +
+            `${s1MatchCount} season-1 match(es) in DB, need ≥50 to confirm previous season.`
+          );
+          continue;
         }
-        console.log(`[scraper] ${comp.name} season 1 standings: ${prevRows.length} rows saved to history.`);
-      } catch (err) {
-        console.warn(`[scraper] ${comp.name} previous standings skipped: ${err.message}`);
+
+        // History is empty BUT ≥50 season_index=1 matches in the DB confirm
+        // a real previous season. Safe to backfill standings_history(1).
+        console.info(
+          `[scraper] ${comp.name} backfilling season 1 standings ` +
+          `(confirmed by ${s1MatchCount} season-1 matches).`
+        );
       }
 
+      for (const row of prevRows) {
+        await upsertStandingHistory(row, comp.id, 1);
+        totalRows++;
+      }
+      console.log(`[scraper] ${comp.name} season 1 standings: ${prevRows.length} rows saved to history.`);
     } catch (err) {
-      console.error(`[scraper] Standings error (comp ${comp.id}): ${err.message}`);
+      console.warn(`[scraper] ${comp.name} previous standings skipped: ${err.message}`);
     }
   }
 
   console.log(`[scraper] Standings done — ${totalRows} rows total.`);
 }
-
 /**
  * Sweep the last STATS_SWEEP_ROUNDS rounds per competition for matches still
  * missing a match_stats row, and fetch /MatchStatistics for each. Builds the
@@ -1239,7 +1295,8 @@ app.get('/matches', asyncHandler(async (req, res) => {
       `*,
        home_team:teams!matches_home_team_id_fkey(id, name, short_name),
        away_team:teams!matches_away_team_id_fkey(id, name, short_name),
-       league:leagues(id, name)`,
+       league:leagues(id, name),
+       goal_events(team_side, minute)`,
       { count: 'exact' }
     )
     .eq('season_index', season)

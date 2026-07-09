@@ -1840,29 +1840,35 @@ async function doExport(format, scope = 2) {
       return { map, lastDate: date };
     }
 
-    // The anchor date is always 2022-08-01 for the OLDEST season being included.
-    // Each season that is actually fetched starts 6 months after the previous one ends.
-    const S_BASE = '2022-08-01';
-    let fakeDates, s0start;
+    // Each season tier is anchored to a fixed August start — the real
+    // football calendar always opens in August regardless of round count.
+    // Within each season the code steps +7 days per round, so leagues
+    // with different round counts spread naturally inside their window:
+    //   38 rounds → Aug → Apr   |   20 rounds → Aug → Dec
+    //
+    //   season_index 2 (oldest)   → 2023/24 → anchor 2023-08-01
+    //   season_index 1 (previous) → 2024/25 → anchor 2024-08-01
+    //   season_index 0 (current)  → 2025/26 → anchor 2025-08-01
+    const S_OLDEST   = '2023-08-01';
+    const S_PREVIOUS = '2024-08-01';
+    const S_CURRENT  = '2025-08-01';
+    const s0start = S_CURRENT;   // used for season label in header
+    let fakeDates;
 
     if (scope === 0) {
-      // Only current season — it starts directly at S_BASE.
-      const { map: s0m } = assignSeasonDates(current, S_BASE);
+      // Current season only → 2025/26
+      const { map: s0m } = assignSeasonDates(current, S_CURRENT);
       fakeDates = s0m;
-      s0start   = S_BASE;
     } else if (scope === 1) {
-      // previous (oldest in scope) starts at S_BASE.
-      const { map: s1m, lastDate: s1l } = assignSeasonDates(previous, S_BASE);
-      s0start = previous.length ? addMonths(s1l, 6) : S_BASE;
-      const { map: s0m } = assignSeasonDates(current, s0start);
+      // Previous → 2024/25, current → 2025/26
+      const { map: s1m } = assignSeasonDates(previous, S_PREVIOUS);
+      const { map: s0m } = assignSeasonDates(current,  S_CURRENT);
       fakeDates = new Map([...s1m, ...s0m]);
     } else {
-      // oldest season starts at S_BASE.
-      const { map: s2m, lastDate: s2l } = assignSeasonDates(oldest,   S_BASE);
-      const s1start = oldest.length   ? addMonths(s2l, 6) : S_BASE;
-      const { map: s1m, lastDate: s1l } = assignSeasonDates(previous, s1start);
-      s0start = previous.length ? addMonths(s1l, 6) : s1start;
-      const { map: s0m } = assignSeasonDates(current, s0start);
+      // Oldest → 2023/24, previous → 2024/25, current → 2025/26
+      const { map: s2m } = assignSeasonDates(oldest,   S_OLDEST);
+      const { map: s1m } = assignSeasonDates(previous, S_PREVIOUS);
+      const { map: s0m } = assignSeasonDates(current,  S_CURRENT);
       fakeDates = new Map([...s2m, ...s1m, ...s0m]);
     }
 
@@ -1892,9 +1898,29 @@ async function doExport(format, scope = 2) {
         .map(v => Math.min(v, 90))
         .sort((a, b) => a - b);
     }
-    // Same string on both mirrored rows (venue-based: H=home, A=away).
-    // Returns null → omit Goals key. Returns '' → verified 0-0.
+    // Same token on both mirrored rows (home=H, away=A from venue perspective).
+    // Returns null -> omit Goals key entirely.
+    // Returns ''   -> verified 0-0 (goal_events present but empty, score 0-0).
     function goalsToken(m) {
+      // Primary path: goal_events array is included by the /matches endpoint
+      // via a Supabase join (goal_events(team_side, minute)).
+      if (Array.isArray(m.goal_events)) {
+        const h = m.goal_events
+          .filter(g => g.team_side === 'home' && g.minute > 0)
+          .map(g => g.minute)
+          .sort((a, b) => a - b);
+        const a = m.goal_events
+          .filter(g => g.team_side === 'away' && g.minute > 0)
+          .map(g => g.minute)
+          .sort((a, b) => a - b);
+        if (h.length === 0 && a.length === 0) {
+          // No goal events stored -- either genuine 0-0 or data not collected.
+          return ((m.home_score || 0) === 0 && (m.away_score || 0) === 0) ? '' : null;
+        }
+        return [...h.map(mn => mn + 'H'), ...a.map(mn => mn + 'A')].join(',');
+      }
+      // Fallback: legacy goalscorers_home/away fields (not present in current
+      // API responses -- only reached if an older API version is in use).
       const hMins = parseGoalMins(m.goalscorers_home);
       const aMins = parseGoalMins(m.goalscorers_away);
       if (hMins === null && aMins === null) return null;
