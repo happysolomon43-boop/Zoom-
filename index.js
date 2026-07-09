@@ -1100,19 +1100,48 @@ async function sweepMissingStats(competitions) {
  * checked every fast cycle and the null/empty result is what determines
  * "nothing live," not a possibly-stale flag.
  */
+/**
+ * Extracts the match array from the various response shapes the Zoom live
+ * endpoint has been observed to return. Log the raw shape once on first
+ * non-null response so it can be confirmed in Render logs.
+ */
+let _liveShapeLogged = false;
+function extractLiveMatches(liveData) {
+  if (!_liveShapeLogged) {
+    const keys = liveData && typeof liveData === 'object' ? Object.keys(liveData) : typeof liveData;
+    console.log(`[scraper][live] API response shape: ${JSON.stringify(keys)}`);
+    _liveShapeLogged = true;
+  }
+
+  if (Array.isArray(liveData)) return liveData;               // plain array of matches
+  if (Array.isArray(liveData.matches)) return liveData.matches; // { matches: [...] }
+  if (Array.isArray(liveData.rounds))                          // { rounds: [{matches}] }
+    return liveData.rounds.flatMap(r => r.matches ?? []);
+  if (liveData.round?.matches)                                 // { round: {matches} } ← most likely
+    return Array.isArray(liveData.round.matches) ? liveData.round.matches : [];
+  return [];
+}
+
 async function scrapeLive(competitions) {
   let liveCount   = 0;
   let fetchErrors = 0;   // tracks API errors (not null/empty — those mean "nothing live")
   const seenMatchIds = new Set();
 
   for (const comp of competitions) {
+    // comp.liveRound comes from /Competition/Init — it's 0 / null when no
+    // round is currently running for this competition, so we can skip the
+    // API call entirely and save 9 requests per cycle when nothing is live.
+    if (!comp.liveRound) continue;
+
     try {
       const liveData = await fetchLiveResults(comp.id);
       if (!liveData) continue;
 
-      const liveMatches = Array.isArray(liveData)
-        ? liveData
-        : (liveData.matches ?? liveData.rounds?.flatMap(r => r.matches ?? []) ?? []);
+      const liveMatches = extractLiveMatches(liveData);
+
+      if (liveMatches.length === 0) {
+        console.log(`[scraper][live] comp ${comp.id} (liveRound=${comp.liveRound}): liveData non-null but 0 matches extracted. Raw keys: ${Object.keys(liveData)}`);
+      }
 
       for (const lm of liveMatches) {
         seenMatchIds.add(lm.matchId);
