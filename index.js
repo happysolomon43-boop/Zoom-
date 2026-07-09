@@ -152,9 +152,22 @@ function parseRoundTime(str) {
 // ── Scraper: Zoom API helpers ────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════
 
+// Timeout for every Zoom API call. Without this, a hung connection from the
+// API would freeze the entire scraper cycle indefinitely — slowInFlight stays
+// true, every subsequent cron tick skips, and data stops updating while logs
+// appear normal (nothing is logged after the hang point).
+const ZOOM_FETCH_TIMEOUT_MS = 15_000; // 15 seconds
+
+function fetchWithTimeout(url, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ZOOM_FETCH_TIMEOUT_MS);
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
 async function zoomGet(path) {
   const url = `${ZOOM_BASE}${path}`;
-  const res = await fetch(url, { headers: ZOOM_HEADERS });
+  const res = await fetchWithTimeout(url, { headers: ZOOM_HEADERS });
   if (!res.ok) throw new Error(`GET ${path} → HTTP ${res.status}`);
   const body = await res.json();
   if (body.status !== 1) {
@@ -168,7 +181,7 @@ async function zoomGet(path) {
 
 async function zoomPost(path, bodyObj) {
   const url = `${ZOOM_BASE}${path}`;
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method:  'POST',
     headers: ZOOM_HEADERS,
     body:    JSON.stringify(bodyObj),
@@ -774,26 +787,24 @@ async function archiveSeasonForComp(competitionId, compName, fromSeason, toSeaso
  * This approach is fully self-healing on every scrape cycle: process restarts,
  * partial failures, and missed cycles all recover automatically.
  */
-/**
- * FIX: recentOnly=true (routine 5-min cycles) fetches only the last
- * STATS_SWEEP_ROUNDS rounds per league instead of ALL historical rounds.
- * Full history (recentOnly=false) runs once at startup and is self-healing
- * for cold starts. Re-fetching thousands of rounds every 5 min was making
- * slow cycles take many minutes and was the second cause of stale data.
- */
-async function scrapeResults(competitions, recentOnly = false) {
+async function scrapeResults(competitions, fullSync = false) {
   let totalMatches = 0;
   let totalGoals   = 0;
 
   for (const comp of competitions) {
     try {
       // ── Previous season (previous=1 → season_index 1) ─────────────────
-      // Skip on routine cycles — previous season data doesn't change often.
-      const prevRounds = recentOnly ? [] : await fetchAllResults(comp.id, 1);
+      // On fullSync (startup): fetch all previous-season rounds and write them.
+      // On routine cycles: fetch a tiny probe (3 rounds) purely for rollover
+      // detection — no DB writes — so the cycle stays fast. Previous-season
+      // data doesn't change between rollovers, so we don't need to write it
+      // every 5 minutes; we only need to detect when a new rollover occurs.
+      const prevRounds = fullSync ? await fetchAllResults(comp.id, 1) : [];
+      const probeRounds = fullSync ? prevRounds : await fetchRecentRounds(comp.id, 3);
 
-      if (prevRounds.length > 0) {
+      if (probeRounds.length > 0) {
         // Rollover detection: sample incoming match IDs against the DB.
-        const sampleIds = prevRounds
+        const sampleIds = probeRounds
           .flatMap(r => (r.matches ?? []).map(m => m.matchId))
           .slice(0, 20);
 
@@ -834,28 +845,28 @@ async function scrapeResults(competitions, recentOnly = false) {
           await archiveSeasonForComp(comp.id, comp.name, 1, 2);
         }
 
-        // Write incoming previous=1 data as season_index=1.
-        // Goal events are included — the Zoom API returns goalscorer data for
-        // previous=1 too, and upsertGoalEvents uses ignoreDuplicates:true so
-        // re-inserting already-known events is a harmless no-op.
-        // This ensures leagues that were never rolled over (first run of this fix)
-        // get full scorer+minute data for all their season-1 matches.
-        for (const round of prevRounds) {
-          for (const match of round.matches ?? []) {
-            await upsertMatch(match, comp.id, round.id, round.time, 1);
-            await upsertGoalEvents(match.matchId, match.goalscorersHome, 'home');
-            await upsertGoalEvents(match.matchId, match.goalscorersAway, 'away');
-            totalMatches++;
-            totalGoals += (match.homeScore ?? 0) + (match.awayScore ?? 0);
+        if (fullSync) {
+          // Write incoming previous=1 data as season_index=1.
+          // Goal events are included — the Zoom API returns goalscorer data for
+          // previous=1 too, and upsertGoalEvents uses ignoreDuplicates:true so
+          // re-inserting already-known events is a harmless no-op.
+          // This ensures leagues that were never rolled over (first run of this fix)
+          // get full scorer+minute data for all their season-1 matches.
+          for (const round of prevRounds) {
+            for (const match of round.matches ?? []) {
+              await upsertMatch(match, comp.id, round.id, round.time, 1);
+              await upsertGoalEvents(match.matchId, match.goalscorersHome, 'home');
+              await upsertGoalEvents(match.matchId, match.goalscorersAway, 'away');
+              totalMatches++;
+              totalGoals += (match.homeScore ?? 0) + (match.awayScore ?? 0);
+            }
           }
+          console.log(`[scraper] ${comp.name} season 1: ${prevRounds.length} rounds scraped.`);
         }
-        console.log(`[scraper] ${comp.name} season 1: ${prevRounds.length} rounds scraped.`);
       }
 
       // ── Current season (previous=0 → season_index 0) ──────────────────
-      const currRounds = recentOnly
-        ? await fetchRecentRounds(comp.id, STATS_SWEEP_ROUNDS)
-        : await fetchAllResults(comp.id, 0);
+      const currRounds = await fetchAllResults(comp.id, 0);
 
       for (const round of currRounds) {
         for (const match of round.matches ?? []) {
@@ -1151,26 +1162,47 @@ let cachedCompetitions = [];
 let slowInFlight = false;
 let fastInFlight = false;
 
-async function runSlowCycle(recentOnly = true) {
+async function runSlowCycle(fullSync = false) {
   if (slowInFlight) {
     console.warn('[scraper][slow] Previous cycle still running — skipping this tick.');
     return;
   }
   slowInFlight = true;
   const label = '[scraper][slow]';
-  console.log(`\n${label} === Slow cycle start ${new Date().toISOString()} (recentOnly=${recentOnly}) ===`);
+  console.log(`\n${label} === Slow cycle start ${new Date().toISOString()} ===`);
   try {
     cachedCompetitions = await syncLeaguesAndTeams();
     // syncStandings runs FIRST so standings_history(1) is populated before
     // scrapeResults may archive it to standings_history(2) on rollover.
     await syncStandings(cachedCompetitions);
-    await scrapeResults(cachedCompetitions, recentOnly);
+    await scrapeResults(cachedCompetitions, fullSync);
     await sweepMissingStats(cachedCompetitions);
     console.log(`${label} === Slow cycle complete ===`);
   } catch (err) {
     console.error(`${label} Unhandled error: ${err.message}`);
   } finally {
     slowInFlight = false;
+  }
+}
+
+// How many recent rounds to fetch per league on every fast cycle.
+// Keeps the fast cycle lightweight — full history stays in the slow cycle.
+const FAST_CYCLE_ROUNDS = 20;
+
+async function scrapeRecentResults(competitions) {
+  for (const comp of competitions) {
+    try {
+      const rounds = await fetchRecentRounds(comp.id, FAST_CYCLE_ROUNDS);
+      for (const round of rounds) {
+        for (const match of round.matches ?? []) {
+          await upsertMatch(match, comp.id, round.id, round.time, 0);
+          await upsertGoalEvents(match.matchId, match.goalscorersHome, 'home');
+          await upsertGoalEvents(match.matchId, match.goalscorersAway, 'away');
+        }
+      }
+    } catch (err) {
+      console.error(`[scraper][fast] Results error (comp ${comp.id}): ${err.message}`);
+    }
   }
 }
 
@@ -1181,7 +1213,11 @@ async function runFastCycle() {
   try {
     const fresh = await fetchCompetitions();
     if (fresh?.competitions) cachedCompetitions = fresh.competitions;
-    await scrapeLive(cachedCompetitions);
+    // Scrape recent results and live matches in parallel.
+    await Promise.all([
+      scrapeRecentResults(cachedCompetitions),
+      scrapeLive(cachedCompetitions),
+    ]);
   } catch (err) {
     console.error(`[scraper][fast] Error: ${err.message}`);
   } finally {
@@ -1546,8 +1582,8 @@ app.listen(PORT, () => {
       runSlowCycle().catch(e => console.error('[scraper][slow] Cron error:', e.message));
     });
 
-    // Every 30 seconds: live matches (fires only when a round is active).
-    cron.schedule('*/30 * * * * *', () => {
+    // Every 20 seconds: recent results + live matches.
+    cron.schedule('*/20 * * * * *', () => {
       runFastCycle().catch(e => console.error('[scraper][fast] Cron error:', e.message));
     }, { scheduled: true, timezone: 'UTC' });
 
@@ -1564,7 +1600,7 @@ app.listen(PORT, () => {
     // retry on their normal schedule — no permanent dead-end.
     try {
       await initRolloverTracking();
-      await runSlowCycle(false); // false = full history fetch on startup
+      await runSlowCycle(true); // full sync on startup — fetches both seasons
       console.log('[scraper] Initial run complete. Running on schedule...');
     } catch (err) {
       console.error(`[scraper] Initial run failed (will retry on next 5-min tick): ${err.message}`);
