@@ -1182,8 +1182,11 @@ app.listen(PORT, () => {
   // Kick off the scraper (not awaited here — runs in the background).
   (async () => {
     console.log('[scraper] Starting Zoom Scores scraper...');
-    await initRolloverTracking();
-    await runSlowCycle();
+
+    // Register all recurring jobs FIRST, unconditionally — so that if the
+    // initial immediate run below fails (e.g. Supabase briefly unreachable
+    // during cold start), the scraper still retries automatically on its
+    // next scheduled tick instead of staying dead until the next redeploy.
 
     // Every 5 minutes: results, standings (+ rollover detection), stats sweep, H2H.
     cron.schedule('*/5 * * * *', () => {
@@ -1201,6 +1204,17 @@ app.listen(PORT, () => {
       selfPing().catch(e => console.error('[keepalive] Cron error:', e.message));
     });
 
-    console.log('[scraper] Cron jobs scheduled. Running...');
-  })().catch(err => console.error('[scraper] Fatal init error:', err));
+    console.log('[scraper] Cron jobs scheduled.');
+
+    // Now attempt an immediate first run, isolated in its own try/catch.
+    // If this fails, the cron jobs above are already registered and will
+    // retry on their normal schedule — no permanent dead-end.
+    try {
+      await initRolloverTracking();
+      await runSlowCycle();
+      console.log('[scraper] Initial run complete. Running on schedule...');
+    } catch (err) {
+      console.error(`[scraper] Initial run failed (will retry on next 5-min tick): ${err.message}`);
+    }
+  })();
 });
