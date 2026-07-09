@@ -429,7 +429,41 @@
     padding: 8px 12px; border-radius: 8px;
   }
   .btn-ghost:active { background: var(--surface-2); }
-  .btn-ghost.export { margin-left: auto; color: var(--green); border-color: rgba(18,183,106,0.35); }
+  .export-wrap { position: relative; margin-left: auto; }
+  .btn-ghost.export { color: var(--green); border-color: rgba(18,183,106,0.35); }
+
+  /* ── Export format picker popover ───────────────────────────────────── */
+  .export-picker {
+    position: absolute;
+    top: calc(100% + 5px);
+    right: 0;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    z-index: 200;
+    min-width: 108px;
+    box-shadow: 0 6px 20px rgba(11,37,69,0.13);
+  }
+  .export-picker button {
+    display: block; width: 100%; text-align: left;
+    padding: 9px 14px;
+    background: none; border: none;
+    border-bottom: 1px solid var(--line);
+    color: var(--text-dim);
+    font-family: var(--font-mono); font-size: 12px; font-weight: 600;
+    cursor: pointer; transition: background 0.12s, color 0.12s;
+  }
+  .export-picker button:last-child { border-bottom: none; }
+  .export-picker button:hover { background: var(--surface-2); color: var(--green); }
+  .export-picker-title {
+    padding: 7px 14px 5px;
+    font-size: 10px; font-weight: 700;
+    color: var(--text-faint);
+    text-transform: uppercase; letter-spacing: 0.06em;
+    border-bottom: 1px solid var(--line);
+    pointer-events: none;
+  }
 
   /* ── Round navigator (Round mode) ────────────────────────────────── */
 
@@ -1235,7 +1269,9 @@ function filterBarHtml() {
       '<span>–</span>' +
       '<input type="date" id="dateTo" value="' + (dateTo ?? '') + '">' +
     '</div>' +
-    '<button class="btn-ghost export" id="exportCsvBtn">Export CSV</button>' +
+    '<div class="export-wrap">' +
+      '<button class="btn-ghost export" id="exportCsvBtn">Export ▾</button>' +
+    '</div>' +
   '</div>';
 }
 
@@ -1245,7 +1281,7 @@ function wireFilterBar() {
   if (df) df.addEventListener('change', e => { dateFrom = e.target.value || null; renderResults(); });
   if (dt) dt.addEventListener('change', e => { dateTo = e.target.value || null; renderResults(); });
   const exp = document.getElementById('exportCsvBtn');
-  if (exp) exp.addEventListener('click', exportCsv);
+  if (exp) exp.addEventListener('click', e => { e.stopPropagation(); toggleExportPicker(exp); });
 }
 
 // ── Round navigator ──────────────────────────────────────────────────
@@ -1666,35 +1702,410 @@ function renderH2HList(records) {
   el.innerHTML = html;
 }
 
-function exportCsv() {
-  const matches = filteredMatches();
-  if (matches.length === 0) { alert('Nothing to export with the current filters.'); return; }
+// ── Export picker ────────────────────────────────────────────────────
 
-  const rows = [['Date', 'League', 'Round', 'Home', 'Away', 'Score', 'HT Score', 'Home Corners', 'Away Corners']];
-  matches.forEach(m => {
-    rows.push([
-      m.round_time ? m.round_time.slice(0, 16).replace('T', ' ') : '',
-      (m.league?.name ?? ''),
-      m.round_id ?? '',
-      m.home_team?.name ?? m.home_team_id,
-      m.away_team?.name ?? m.away_team_id,
-      (m.home_score ?? 0) + '-' + (m.away_score ?? 0),
-      (m.ht_home_score ?? 0) + '-' + (m.ht_away_score ?? 0),
-      m.home_corners ?? '',
-      m.away_corners ?? '',
-    ]);
+// Build and attach a picker popover to btn.parentNode.
+// options: [{ label, dataset: {key: value} }]
+// onPick(dataset) is called when an option is clicked.
+function _showPicker(btn, titleText, options, onPick) {
+  document.getElementById('exportPicker')?.remove();
+
+  const picker = document.createElement('div');
+  picker.id = 'exportPicker';
+  picker.className = 'export-picker';
+
+  const title = document.createElement('div');
+  title.className = 'export-picker-title';
+  title.textContent = titleText;
+  picker.appendChild(title);
+
+  options.forEach(({ label, dataset }) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    Object.entries(dataset).forEach(([k, v]) => (b.dataset[k] = v));
+    picker.appendChild(b);
   });
 
-  const csv = rows.map(r => r.map(cell => '"' + String(cell).replace(/"/g, '""') + '"').join(',')).join('\n');
-  const blob = new Blob([csv], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'zoom-results-' + new Date().toISOString().slice(0, 10) + '.csv';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  btn.parentNode.appendChild(picker);
+
+  picker.addEventListener('click', e => {
+    const b = e.target.closest('button[data-' + Object.keys(options[0].dataset)[0] + ']');
+    if (!b) return;
+    picker.remove();
+    document.removeEventListener('click', onOutside, true);
+    onPick(b.dataset);
+  });
+
+  function onOutside(e) {
+    if (!picker.contains(e.target) && e.target !== btn) {
+      picker.remove();
+      document.removeEventListener('click', onOutside, true);
+    }
+  }
+  setTimeout(() => document.addEventListener('click', onOutside, true), 0);
+}
+
+function toggleExportPicker(btn) {
+  if (document.getElementById('exportPicker')) {
+    document.getElementById('exportPicker').remove();
+    return;
+  }
+
+  _showPicker(btn, 'Export format:', [
+    { label: '📄 .txt', dataset: { fmt: 'txt' } },
+    { label: '📊 .csv', dataset: { fmt: 'csv' } },
+    { label: '📝 .md',  dataset: { fmt: 'md'  } },
+    { label: '🐍 .py',  dataset: { fmt: 'py'  } },
+  ], ({ fmt }) => {
+    // Step 2: ask how many seasons
+    _showPicker(btn, 'Seasons to include:', [
+      { label: 'Current season only',  dataset: { scope: '0' } },
+      { label: '+ 1 previous season',  dataset: { scope: '1' } },
+      { label: 'All 3 seasons',        dataset: { scope: '2' } },
+    ], ({ scope }) => {
+      doExport(fmt, parseInt(scope, 10));
+    });
+  });
+}
+
+// ── Shared export engine ─────────────────────────────────────────────
+// scope: 0 = current season only | 1 = current + 1 previous | 2 = all 3 seasons
+
+async function doExport(format, scope = 2) {
+  if (!selectedLeagueId) {
+    alert('Select a specific league first — the export needs all three seasons for one league.');
+    return;
+  }
+
+  const btn = document.getElementById('exportCsvBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Exporting…'; }
+
+  try {
+    // ── 1. Fetch the requested seasons ─────────────────────────────────
+    async function fetchAllSeason(season) {
+      const all = [];
+      let offset = 0;
+      while (true) {
+        const d = await api('/matches?leagueId=' + selectedLeagueId + '&season=' + season + '&limit=500&offset=' + offset);
+        const batch = d.matches || [];
+        all.push(...batch);
+        offset += batch.length;
+        if (batch.length < 500 || offset >= (d.total || 0)) break;
+      }
+      all.sort((a, b) => (a.round_id || 0) - (b.round_id || 0) || (a.match_id || 0) - (b.match_id || 0));
+      return all;
+    }
+
+    const [current, previous, oldest] = await Promise.all([
+      fetchAllSeason(0),
+      scope >= 1 ? fetchAllSeason(1) : Promise.resolve([]),
+      scope >= 2 ? fetchAllSeason(2) : Promise.resolve([]),
+    ]);
+
+    // chronological order: oldest first
+    const allMatches = [...oldest, ...previous, ...current];
+    if (allMatches.length === 0) {
+      alert('No match data found for this league across any season.');
+      return;
+    }
+
+    // ── 2. Date helpers ─────────────────────────────────────────────────
+    function addDays(dateStr, n) {
+      const d = new Date(dateStr + 'T00:00:00Z');
+      d.setUTCDate(d.getUTCDate() + n);
+      return d.toISOString().slice(0, 10);
+    }
+    function addMonths(dateStr, n) {
+      const d = new Date(dateStr + 'T00:00:00Z');
+      d.setUTCMonth(d.getUTCMonth() + n);
+      return d.toISOString().slice(0, 10);
+    }
+
+    // ── 3. Assign fake dates ────────────────────────────────────────────
+    function assignSeasonDates(matches, startDate) {
+      const map = new Map();
+      if (!matches.length) return { map, lastDate: startDate };
+      const rounds = new Map();
+      matches.forEach(m => {
+        const r = m.round_id ?? 1;
+        if (!rounds.has(r)) rounds.set(r, []);
+        rounds.get(r).push(m);
+      });
+      const sortedRoundIds = [...rounds.keys()].sort((a, b) => a - b);
+      let date = startDate;
+      sortedRoundIds.forEach((rid, idx) => {
+        if (idx > 0) date = addDays(date, 7);
+        rounds.get(rid).forEach(m => map.set(m.match_id, date));
+      });
+      return { map, lastDate: date };
+    }
+
+    // The anchor date is always 2022-08-01 for the OLDEST season being included.
+    // Each season that is actually fetched starts 6 months after the previous one ends.
+    const S_BASE = '2022-08-01';
+    let fakeDates, s0start;
+
+    if (scope === 0) {
+      // Only current season — it starts directly at S_BASE.
+      const { map: s0m } = assignSeasonDates(current, S_BASE);
+      fakeDates = s0m;
+      s0start   = S_BASE;
+    } else if (scope === 1) {
+      // previous (oldest in scope) starts at S_BASE.
+      const { map: s1m, lastDate: s1l } = assignSeasonDates(previous, S_BASE);
+      s0start = previous.length ? addMonths(s1l, 6) : S_BASE;
+      const { map: s0m } = assignSeasonDates(current, s0start);
+      fakeDates = new Map([...s1m, ...s0m]);
+    } else {
+      // oldest season starts at S_BASE.
+      const { map: s2m, lastDate: s2l } = assignSeasonDates(oldest,   S_BASE);
+      const s1start = oldest.length   ? addMonths(s2l, 6) : S_BASE;
+      const { map: s1m, lastDate: s1l } = assignSeasonDates(previous, s1start);
+      s0start = previous.length ? addMonths(s1l, 6) : s1start;
+      const { map: s0m } = assignSeasonDates(current, s0start);
+      fakeDates = new Map([...s2m, ...s1m, ...s0m]);
+    }
+
+    // ── 4. Header values ────────────────────────────────────────────────
+    function seasonLabel(dateStr) {
+      const y  = parseInt(dateStr.slice(0, 4), 10);
+      const mo = parseInt(dateStr.slice(5, 7), 10);
+      return mo >= 6 ? y + '/' + String(y + 1).slice(-2)
+                     : (y - 1) + '/' + String(y).slice(-2);
+    }
+    const firstMatch       = allMatches.find(m => m.league?.name);
+    const leagueName       = shortLeagueName(firstMatch?.league?.name || 'League');
+    const currentMatchday  = current.length ? Math.max(...current.map(m => m.round_id || 0)) : 0;
+    const currentSeasonLbl = seasonLabel(s0start);
+    const scopeSuffix      = ['current-only', '2-seasons', 'all-seasons'][scope] ?? 'export';
+    const fileBase         = leagueName.replace(/[\s/\\]+/g, '-') + '-' + scopeSuffix;
+
+    // ── 5. Goal-minute helpers ──────────────────────────────────────────
+    function parseGoalMins(field) {
+      if (field == null) return null;
+      let arr = field;
+      if (typeof arr === 'string') { try { arr = JSON.parse(arr); } catch { return null; } }
+      if (!Array.isArray(arr)) return null;
+      return arr
+        .map(s => parseInt(s.time ?? s.minute ?? s.min ?? '', 10))
+        .filter(v => v > 0)
+        .map(v => Math.min(v, 90))
+        .sort((a, b) => a - b);
+    }
+    // Same string on both mirrored rows (venue-based: H=home, A=away).
+    // Returns null → omit Goals key. Returns '' → verified 0-0.
+    function goalsToken(m) {
+      const hMins = parseGoalMins(m.goalscorers_home);
+      const aMins = parseGoalMins(m.goalscorers_away);
+      if (hMins === null && aMins === null) return null;
+      const h = hMins || [], a = aMins || [];
+      if (h.length === 0 && a.length === 0) {
+        return ((m.home_score || 0) === 0 && (m.away_score || 0) === 0) ? '' : null;
+      }
+      return [...h.map(mn => mn + 'H'), ...a.map(mn => mn + 'A')].join(',');
+    }
+
+    // Per-perspective field values
+    function rowFields(m, side) {
+      const isHome = side === 'home';
+      return {
+        team:     isHome ? (m.home_team?.name ?? m.home_team_id) : (m.away_team?.name ?? m.away_team_id),
+        opp:      isHome ? (m.away_team?.name ?? m.away_team_id) : (m.home_team?.name ?? m.home_team_id),
+        venue:    isHome ? 'H' : 'A',
+        scored:   isHome ? (m.home_score    ?? 0) : (m.away_score    ?? 0),
+        conceded: isHome ? (m.away_score    ?? 0) : (m.home_score    ?? 0),
+        htSc:     isHome ? (m.ht_home_score ?? 0) : (m.ht_away_score ?? 0),
+        htCon:    isHome ? (m.ht_away_score ?? 0) : (m.ht_home_score ?? 0),
+        cornW:    isHome ? m.home_corners : m.away_corners,
+        cornC:    isHome ? m.away_corners : m.home_corners,
+      };
+    }
+
+    // H2H encounter list for the latest round's fixtures
+    const latestRound = current.filter(m => m.round_id === currentMatchday);
+    const h2hEncounters = [];  // [{date, hName, score, aName}]
+    latestRound.forEach(fixture => {
+      const tA = fixture.home_team_id, tB = fixture.away_team_id;
+      allMatches
+        .filter(m => (m.home_team_id===tA && m.away_team_id===tB) || (m.home_team_id===tB && m.away_team_id===tA))
+        .sort((a, b) => (fakeDates.get(b.match_id)||'').localeCompare(fakeDates.get(a.match_id)||''))
+        .forEach(enc => {
+          h2hEncounters.push({
+            date:  fakeDates.get(enc.match_id) || '2000-01-01',
+            hName: enc.home_team?.name ?? enc.home_team_id,
+            score: (enc.home_score ?? 0) + '-' + (enc.away_score ?? 0),
+            aName: enc.away_team?.name ?? enc.away_team_id,
+          });
+        });
+    });
+
+    // ── 6. Format renderers ─────────────────────────────────────────────
+
+    function renderTxt() {
+      const lines = [
+        'League: '           + leagueName,
+        'Season: '           + currentSeasonLbl,
+        'Current Matchday: ' + currentMatchday,
+        '',
+      ];
+      let n = 0;
+      allMatches.forEach(m => {
+        const fd = fakeDates.get(m.match_id) || '2000-01-01';
+        const gt = goalsToken(m);
+        ['home', 'away'].forEach(side => {
+          const f = rowFields(m, side);
+          const parts = [
+            'Date: ' + fd,
+            'Team: ' + f.team,
+            'Opponent: ' + f.opp + ' (' + f.venue + ')',
+            'Goals Scored: ' + f.scored,
+            'Goals Conceded: ' + f.conceded,
+            'HT Scored: ' + f.htSc,
+            'HT Conceded: ' + f.htCon,
+          ];
+          if (f.cornW != null) parts.push('Corners Won: ' + f.cornW);
+          if (f.cornC != null) parts.push('Corners Conceded: ' + f.cornC);
+          if (gt !== null) parts.push('Goals: ' + gt);
+          lines.push('Match ' + (++n) + ': ' + parts.join(' | '));
+        });
+      });
+      if (h2hEncounters.length) {
+        lines.push('', 'HEAD TO HEAD');
+        h2hEncounters.forEach(e => lines.push(e.date + ' ' + e.hName + ' ' + e.score + ' ' + e.aName));
+      }
+      return lines.join('\n');
+    }
+
+    function renderCsv() {
+      const esc = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+      const header = ['Match','Date','Team','Opponent','Venue',
+                      'Goals Scored','Goals Conceded','HT Scored','HT Conceded',
+                      'Corners Won','Corners Conceded','Goals'];
+      const rows = [header.map(esc).join(',')];
+      let n = 0;
+      allMatches.forEach(m => {
+        const fd = fakeDates.get(m.match_id) || '2000-01-01';
+        const gt = goalsToken(m);
+        ['home', 'away'].forEach(side => {
+          const f = rowFields(m, side);
+          rows.push([
+            ++n, fd, f.team, f.opp, f.venue,
+            f.scored, f.conceded, f.htSc, f.htCon,
+            f.cornW ?? '', f.cornC ?? '', gt ?? '',
+          ].map(esc).join(','));
+        });
+      });
+      if (h2hEncounters.length) {
+        rows.push('');
+        rows.push('"HEAD TO HEAD"');
+        rows.push(['"Date"','"Home"','"Score"','"Away"'].join(','));
+        h2hEncounters.forEach(e =>
+          rows.push([e.date, e.hName, e.score, e.aName].map(esc).join(','))
+        );
+      }
+      return rows.join('\n');
+    }
+
+    function renderMd() {
+      const esc = s => String(s ?? '').replace(/\|/g, '\\|');
+      const lines = [
+        '# ' + leagueName + ' — All Seasons Export',
+        '',
+        '**Season:** ' + currentSeasonLbl + '  |  **Current Matchday:** ' + currentMatchday,
+        '',
+        '## Match Results',
+        '',
+        '| # | Date | Team | Opponent | Venue | Scored | Conceded | HT Sc | HT Con | Corners W | Corners C | Goals |',
+        '|--:|------|------|----------|:-----:|-------:|---------:|------:|-------:|----------:|----------:|-------|',
+      ];
+      let n = 0;
+      allMatches.forEach(m => {
+        const fd = fakeDates.get(m.match_id) || '2000-01-01';
+        const gt = goalsToken(m);
+        ['home', 'away'].forEach(side => {
+          const f = rowFields(m, side);
+          lines.push(
+            '| ' + (++n) + ' | ' + fd + ' | ' + esc(f.team) + ' | ' + esc(f.opp) + ' | ' +
+            f.venue + ' | ' + f.scored + ' | ' + f.conceded + ' | ' +
+            f.htSc + ' | ' + f.htCon + ' | ' +
+            (f.cornW ?? '—') + ' | ' + (f.cornC ?? '—') + ' | ' + esc(gt ?? '') + ' |'
+          );
+        });
+      });
+      if (h2hEncounters.length) {
+        lines.push('', '## Head to Head', '',
+          '| Date | Home | Score | Away |',
+          '|------|------|:-----:|------|');
+        h2hEncounters.forEach(e =>
+          lines.push('| ' + e.date + ' | ' + esc(e.hName) + ' | ' + e.score + ' | ' + esc(e.aName) + ' |')
+        );
+      }
+      return lines.join('\n');
+    }
+
+    function renderPy() {
+      const q = s => '"' + String(s ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+      const lines = [
+        '# ' + leagueName + ' — All Seasons Export',
+        '# Season: ' + currentSeasonLbl + ' | Current Matchday: ' + currentMatchday,
+        '# Auto-generated — do not edit manually.',
+        '',
+        'LEAGUE = ' + q(leagueName),
+        'SEASON = ' + q(currentSeasonLbl),
+        'CURRENT_MATCHDAY = ' + currentMatchday,
+        '',
+        '# (match_num, date, team, opponent, venue,',
+        '#  goals_scored, goals_conceded, ht_scored, ht_conceded,',
+        '#  corners_won, corners_conceded, goals)',
+        'MATCHES = [',
+      ];
+      let n = 0;
+      allMatches.forEach(m => {
+        const fd = fakeDates.get(m.match_id) || '2000-01-01';
+        const gt = goalsToken(m);
+        ['home', 'away'].forEach(side => {
+          const f = rowFields(m, side);
+          lines.push(
+            '    (' + (++n) + ', ' + q(fd) + ', ' + q(f.team) + ', ' + q(f.opp) + ', ' + q(f.venue) + ', ' +
+            f.scored + ', ' + f.conceded + ', ' + f.htSc + ', ' + f.htCon + ', ' +
+            (f.cornW ?? 'None') + ', ' + (f.cornC ?? 'None') + ', ' + (gt !== null ? q(gt) : 'None') + '),'
+          );
+        });
+      });
+      lines.push(']', '');
+      if (h2hEncounters.length) {
+        lines.push('# (date, home_team, home_score, away_score, away_team)', 'HEAD_TO_HEAD = [');
+        h2hEncounters.forEach(e => {
+          const [hs, as_] = e.score.split('-');
+          lines.push('    (' + q(e.date) + ', ' + q(e.hName) + ', ' + hs + ', ' + as_ + ', ' + q(e.aName) + '),');
+        });
+        lines.push(']');
+      }
+      return lines.join('\n');
+    }
+
+    // ── 7. Dispatch & download ──────────────────────────────────────────
+    const renderers = { txt: renderTxt, csv: renderCsv, md: renderMd, py: renderPy };
+    const mimeTypes = {
+      txt: 'text/plain', csv: 'text/csv', md: 'text/markdown', py: 'text/x-python',
+    };
+    const content  = renderers[format]();
+    const blob     = new Blob([content], { type: (mimeTypes[format] || 'text/plain') + ';charset=utf-8' });
+    const url      = URL.createObjectURL(blob);
+    const a        = document.createElement('a');
+    a.href         = url;
+    a.download     = fileBase + '.' + format;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+  } catch (err) {
+    alert('Export failed: ' + err.message);
+    console.error('[export]', err);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Export ▾'; }
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════

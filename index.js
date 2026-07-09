@@ -649,6 +649,15 @@ async function scrapeResults(competitions) {
           await upsertMatch(match, comp.id, round.id, round.time);
           await upsertGoalEvents(match.matchId, match.goalscorersHome, 'home');
           await upsertGoalEvents(match.matchId, match.goalscorersAway, 'away');
+
+          // FIX: Build H2H immediately from match data so records are saved even
+          // when the stats window closes before sweepMissingStats runs.
+          // Possession fields start null; sweepMissingStats fills them in via upsert
+          // when stats become available.
+          await buildAndUpsertH2H(match, round.time, null).catch(err =>
+            console.error(`[h2h] scrapeResults error (match ${match.matchId}): ${err.message}`)
+          );
+
           totalMatches++;
           totalGoals += (match.homeScore ?? 0) + (match.awayScore ?? 0);
         }
@@ -770,7 +779,8 @@ async function sweepMissingStats(competitions) {
  * "nothing live," not a possibly-stale flag.
  */
 async function scrapeLive(competitions) {
-  let liveCount      = 0;
+  let liveCount   = 0;
+  let fetchErrors = 0;   // tracks API errors (not null/empty — those mean "nothing live")
   const seenMatchIds = new Set();
 
   for (const comp of competitions) {
@@ -780,7 +790,7 @@ async function scrapeLive(competitions) {
 
       const liveMatches = Array.isArray(liveData)
         ? liveData
-        : (liveData.matches ?? liveData.rounds?.flatMap(r => r.matches) ?? []);
+        : (liveData.matches ?? liveData.rounds?.flatMap(r => r.matches ?? []) ?? []);
 
       for (const lm of liveMatches) {
         seenMatchIds.add(lm.matchId);
@@ -794,20 +804,27 @@ async function scrapeLive(competitions) {
         liveCount++;
       }
     } catch (err) {
+      fetchErrors++;
       console.error(`[scraper] Live error (comp ${comp.id}): ${err.message}`);
     }
   }
 
-  try {
-    const { data: staleLive } = await supabase.from('live_matches').select('match_id');
-    for (const row of staleLive ?? []) {
-      if (!seenMatchIds.has(row.match_id)) {
-        await removeLiveMatch(row.match_id);
-        console.log(`[scraper] Removed stale live match ${row.match_id}.`);
+  // Only purge stale rows when every competition fetch succeeded (or returned null = nothing live).
+  // If ANY fetch threw an error we can't tell which matches are truly stale, so we leave them.
+  if (fetchErrors === 0) {
+    try {
+      const { data: staleLive } = await supabase.from('live_matches').select('match_id');
+      for (const row of staleLive ?? []) {
+        if (!seenMatchIds.has(row.match_id)) {
+          await removeLiveMatch(row.match_id);
+          console.log(`[scraper] Removed stale live match ${row.match_id}.`);
+        }
       }
+    } catch (err) {
+      console.error(`[scraper] Live cleanup error: ${err.message}`);
     }
-  } catch (err) {
-    console.error(`[scraper] Live cleanup error: ${err.message}`);
+  } else {
+    console.warn(`[scraper] Live cleanup skipped — ${fetchErrors} fetch error(s). Stale rows preserved.`);
   }
 
   if (liveCount > 0) {
