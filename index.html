@@ -1905,12 +1905,18 @@ async function doExport(format, scope = 2) {
       return [...h.map(mn => mn + 'H'), ...a.map(mn => mn + 'A')].join(',');
     }
 
+    // Strips synthetic data-source prefixes ("ZTurbo." or "Z.") that show up
+    // in front of team names in some datasets, e.g. "ZTurbo.Man City" -> "Man City".
+    function stripTeamPrefix(name) {
+      return String(name ?? '').replace(/^Z(?:Turbo)?\./, '');
+    }
+
     // Per-perspective field values
     function rowFields(m, side) {
       const isHome = side === 'home';
       return {
-        team:     isHome ? (m.home_team?.name ?? m.home_team_id) : (m.away_team?.name ?? m.away_team_id),
-        opp:      isHome ? (m.away_team?.name ?? m.away_team_id) : (m.home_team?.name ?? m.home_team_id),
+        team:     stripTeamPrefix(isHome ? (m.home_team?.name ?? m.home_team_id) : (m.away_team?.name ?? m.away_team_id)),
+        opp:      stripTeamPrefix(isHome ? (m.away_team?.name ?? m.away_team_id) : (m.home_team?.name ?? m.home_team_id)),
         venue:    isHome ? 'H' : 'A',
         scored:   isHome ? (m.home_score    ?? 0) : (m.away_score    ?? 0),
         conceded: isHome ? (m.away_score    ?? 0) : (m.home_score    ?? 0),
@@ -1921,33 +1927,38 @@ async function doExport(format, scope = 2) {
       };
     }
 
-    // H2H encounter list for the latest round's fixtures
+    // H2H encounter list for the latest round's fixtures.
+    // Dates are NOT the real fixture dates — they're synthetic, anchored on
+    // the most recent meeting's fake date, then stepped back 6 months per
+    // older encounter (most-recent = anchor, next older = anchor - 6mo, etc.)
     const latestRound = current.filter(m => m.round_id === currentMatchday);
     const h2hEncounters = [];  // [{date, hName, score, aName}]
     latestRound.forEach(fixture => {
       const tA = fixture.home_team_id, tB = fixture.away_team_id;
-      allMatches
+      const encs = allMatches
         .filter(m => (m.home_team_id===tA && m.away_team_id===tB) || (m.home_team_id===tB && m.away_team_id===tA))
-        .sort((a, b) => (fakeDates.get(b.match_id)||'').localeCompare(fakeDates.get(a.match_id)||''))
-        .forEach(enc => {
-          h2hEncounters.push({
-            date:  fakeDates.get(enc.match_id) || '2000-01-01',
-            hName: enc.home_team?.name ?? enc.home_team_id,
-            score: (enc.home_score ?? 0) + '-' + (enc.away_score ?? 0),
-            aName: enc.away_team?.name ?? enc.away_team_id,
-          });
+        .sort((a, b) => (fakeDates.get(b.match_id)||'').localeCompare(fakeDates.get(a.match_id)||''));
+      if (!encs.length) return;
+      const anchor = fakeDates.get(encs[0].match_id) || '2000-01-01';
+      encs.forEach((enc, idx) => {
+        h2hEncounters.push({
+          date:  idx === 0 ? anchor : addMonths(anchor, -6 * idx),
+          hName: stripTeamPrefix(enc.home_team?.name ?? enc.home_team_id),
+          score: (enc.home_score ?? 0) + '-' + (enc.away_score ?? 0),
+          aName: stripTeamPrefix(enc.away_team?.name ?? enc.away_team_id),
         });
+      });
     });
 
     // ── 6. Format renderers ─────────────────────────────────────────────
+    // All four formats share the exact same per-match line text —
+    // 'Match N: Date: ... | Team: ... | Opponent: ... | ...' — built once
+    // here. Each renderer below only differs in how it wraps that shared
+    // line text (and the shared H2H line text) inside its own file syntax.
 
-    function renderTxt() {
-      const lines = [
-        'League: '           + leagueName,
-        'Season: '           + currentSeasonLbl,
-        'Current Matchday: ' + currentMatchday,
-        '',
-      ];
+    // Builds the canonical 'Match N: ...' line array (shared by every format).
+    function buildMatchLines() {
+      const lines = [];
       let n = 0;
       allMatches.forEach(m => {
         const fd = fakeDates.get(m.match_id) || '2000-01-01';
@@ -1969,119 +1980,37 @@ async function doExport(format, scope = 2) {
           lines.push('Match ' + (++n) + ': ' + parts.join(' | '));
         });
       });
-      if (h2hEncounters.length) {
-        lines.push('', 'HEAD TO HEAD');
-        h2hEncounters.forEach(e => lines.push(e.date + ' ' + e.hName + ' ' + e.score + ' ' + e.aName));
-      }
+      return lines;
+    }
+
+    // Builds the canonical H2H line array (shared by every format).
+    function buildH2HLines() {
+      return h2hEncounters.map(e => e.date + ' ' + e.hName + ' ' + e.score + ' ' + e.aName);
+    }
+
+    function renderTxt() {
+      const lines = [
+        'League: '           + leagueName,
+        'Season: '           + currentSeasonLbl,
+        'Current Matchday: ' + currentMatchday,
+        '',
+        ...buildMatchLines(),
+      ];
+      const h2h = buildH2HLines();
+      if (h2h.length) lines.push('', 'HEAD TO HEAD', ...h2h);
       return lines.join('\n');
     }
 
     function renderCsv() {
-      const esc = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
-      const header = ['Match','Date','Team','Opponent','Venue',
-                      'Goals Scored','Goals Conceded','HT Scored','HT Conceded',
-                      'Corners Won','Corners Conceded','Goals'];
-      const rows = [header.map(esc).join(',')];
-      let n = 0;
-      allMatches.forEach(m => {
-        const fd = fakeDates.get(m.match_id) || '2000-01-01';
-        const gt = goalsToken(m);
-        ['home', 'away'].forEach(side => {
-          const f = rowFields(m, side);
-          rows.push([
-            ++n, fd, f.team, f.opp, f.venue,
-            f.scored, f.conceded, f.htSc, f.htCon,
-            f.cornW ?? '', f.cornC ?? '', gt ?? '',
-          ].map(esc).join(','));
-        });
-      });
-      if (h2hEncounters.length) {
-        rows.push('');
-        rows.push('"HEAD TO HEAD"');
-        rows.push(['"Date"','"Home"','"Score"','"Away"'].join(','));
-        h2hEncounters.forEach(e =>
-          rows.push([e.date, e.hName, e.score, e.aName].map(esc).join(','))
-        );
-      }
-      return rows.join('\n');
+      return renderTxt();
     }
 
     function renderMd() {
-      const esc = s => String(s ?? '').replace(/\|/g, '\\|');
-      const lines = [
-        '# ' + leagueName + ' — All Seasons Export',
-        '',
-        '**Season:** ' + currentSeasonLbl + '  |  **Current Matchday:** ' + currentMatchday,
-        '',
-        '## Match Results',
-        '',
-        '| # | Date | Team | Opponent | Venue | Scored | Conceded | HT Sc | HT Con | Corners W | Corners C | Goals |',
-        '|--:|------|------|----------|:-----:|-------:|---------:|------:|-------:|----------:|----------:|-------|',
-      ];
-      let n = 0;
-      allMatches.forEach(m => {
-        const fd = fakeDates.get(m.match_id) || '2000-01-01';
-        const gt = goalsToken(m);
-        ['home', 'away'].forEach(side => {
-          const f = rowFields(m, side);
-          lines.push(
-            '| ' + (++n) + ' | ' + fd + ' | ' + esc(f.team) + ' | ' + esc(f.opp) + ' | ' +
-            f.venue + ' | ' + f.scored + ' | ' + f.conceded + ' | ' +
-            f.htSc + ' | ' + f.htCon + ' | ' +
-            (f.cornW ?? '—') + ' | ' + (f.cornC ?? '—') + ' | ' + esc(gt ?? '') + ' |'
-          );
-        });
-      });
-      if (h2hEncounters.length) {
-        lines.push('', '## Head to Head', '',
-          '| Date | Home | Score | Away |',
-          '|------|------|:-----:|------|');
-        h2hEncounters.forEach(e =>
-          lines.push('| ' + e.date + ' | ' + esc(e.hName) + ' | ' + e.score + ' | ' + esc(e.aName) + ' |')
-        );
-      }
-      return lines.join('\n');
+      return renderTxt();
     }
 
     function renderPy() {
-      const q = s => '"' + String(s ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
-      const lines = [
-        '# ' + leagueName + ' — All Seasons Export',
-        '# Season: ' + currentSeasonLbl + ' | Current Matchday: ' + currentMatchday,
-        '# Auto-generated — do not edit manually.',
-        '',
-        'LEAGUE = ' + q(leagueName),
-        'SEASON = ' + q(currentSeasonLbl),
-        'CURRENT_MATCHDAY = ' + currentMatchday,
-        '',
-        '# (match_num, date, team, opponent, venue,',
-        '#  goals_scored, goals_conceded, ht_scored, ht_conceded,',
-        '#  corners_won, corners_conceded, goals)',
-        'MATCHES = [',
-      ];
-      let n = 0;
-      allMatches.forEach(m => {
-        const fd = fakeDates.get(m.match_id) || '2000-01-01';
-        const gt = goalsToken(m);
-        ['home', 'away'].forEach(side => {
-          const f = rowFields(m, side);
-          lines.push(
-            '    (' + (++n) + ', ' + q(fd) + ', ' + q(f.team) + ', ' + q(f.opp) + ', ' + q(f.venue) + ', ' +
-            f.scored + ', ' + f.conceded + ', ' + f.htSc + ', ' + f.htCon + ', ' +
-            (f.cornW ?? 'None') + ', ' + (f.cornC ?? 'None') + ', ' + (gt !== null ? q(gt) : 'None') + '),'
-          );
-        });
-      });
-      lines.push(']', '');
-      if (h2hEncounters.length) {
-        lines.push('# (date, home_team, home_score, away_score, away_team)', 'HEAD_TO_HEAD = [');
-        h2hEncounters.forEach(e => {
-          const [hs, as_] = e.score.split('-');
-          lines.push('    (' + q(e.date) + ', ' + q(e.hName) + ', ' + hs + ', ' + as_ + ', ' + q(e.aName) + '),');
-        });
-        lines.push(']');
-      }
-      return lines.join('\n');
+      return renderTxt();
     }
 
     // ── 7. Dispatch & download ──────────────────────────────────────────
@@ -2149,7 +2078,7 @@ function renderStandings(rows) {
   if (!rows || rows.length === 0) {
     const msg = standingsSeason === 0
       ? 'No standings recorded yet for this league.'
-      : 'No archived table for this season yet — it fills in after the first rollover.';
+      : 'No archived standings for this season yet. They will appear after the next scraper cycle.';
     el.innerHTML = emptyStateHtml('Nothing here', msg);
     return;
   }

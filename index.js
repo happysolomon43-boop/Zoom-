@@ -35,10 +35,11 @@
  *
  * Season rotation model:
  *   season_index 0 = current season  (always updated live)
- *   season_index 1 = most recent previous season (read-only archive)
- *   season_index 2 = oldest previous season (deleted on next rollover)
- *   Detection: standings.played drops sharply AND round_id resets to a
- *   low number — both signals must fire together to prevent false triggers.
+ *   season_index 1 = most recent previous season
+ *   season_index 2 = oldest previous season
+ *   The scraper fetches all three directly from the Zoom API (previous=0/1/2)
+ *   and writes season_index explicitly on every cycle — no dependency on the
+ *   rollover RPC. The rollover RPC remains as a fallback but is not required.
  *
  * H2H model:
  *   Built entirely from our own matches table (not from API's sparse embed).
@@ -190,16 +191,28 @@ async function fetchCompetitions() {
 /**
  * Fetches ALL rounds for a competition (auto-paginates).
  * Returns an array of round objects: { id, time, matches }.
+ * previous=0 = current season, previous=1 = last season, previous=2 = oldest season.
  */
-async function fetchAllResults(competitionId) {
+async function fetchAllResults(competitionId, previous = 0) {
   const limit = 100;
   let offset  = 0;
   const allRounds = [];
 
   while (true) {
-    const data = await zoomGet(
-      `/SeasonResult/Results?clientId=${CLIENT_ID}&competitionId=${competitionId}&previous=0&offset=${offset}&limit=${limit}`
-    );
+    let data;
+    try {
+      data = await zoomGet(
+        `/SeasonResult/Results?clientId=${CLIENT_ID}&competitionId=${competitionId}&previous=${previous}&offset=${offset}&limit=${limit}`
+      );
+    } catch (err) {
+      // status=-1 means the API has no data for this previous value (season not available).
+      // Treat as empty rather than an error so the caller loop stays clean.
+      if (/status\s*-?1/i.test(err.message) || /no.?data/i.test(err.message)) {
+        if (offset === 0) console.info(`[scraper] comp ${competitionId} previous=${previous}: no season data available.`);
+        break;
+      }
+      throw err; // real network/parse error — propagate normally
+    }
     if (!data || !data.rounds || data.rounds.length === 0) break;
     allRounds.push(...data.rounds);
     const total = data.total_rounds ?? data.rounds.length;
@@ -220,11 +233,26 @@ async function fetchRecentRounds(competitionId, limit = STATS_SWEEP_ROUNDS) {
   return data?.rounds ?? [];
 }
 
-/** Returns standings array for a competition. */
+/** Returns standings array for a competition (current season). */
 async function fetchStandings(competitionId) {
   return zoomGet(
     `/SeasonResult/Statistics?clientId=${CLIENT_ID}&competitionId=${competitionId}`
   );
+}
+
+/**
+ * Returns standings for a previous season (previous=1 → last, previous=2 → oldest).
+ * Falls back to null/empty if the Statistics endpoint ignores the param.
+ */
+async function fetchStandingsForSeason(competitionId, previous) {
+  try {
+    return await zoomGet(
+      `/SeasonResult/Statistics?clientId=${CLIENT_ID}&competitionId=${competitionId}&previous=${previous}`
+    );
+  } catch (err) {
+    if (/status\s*-?1/i.test(err.message) || /no.?data/i.test(err.message)) return null;
+    throw err;
+  }
 }
 
 /** Returns live round data; null if no round is currently live. */
@@ -289,11 +317,12 @@ async function upsertLeagueTeam(leagueId, teamId) {
 
 /**
  * Upsert a completed match row.
- * IMPORTANT: season_index is intentionally NOT included in the row object.
- *   - New inserts:  DB DEFAULT (0) is used → current season ✓
- *   - Existing rows: season_index is preserved as-is on conflict update ✓
+ * seasonIndex maps directly to the Zoom API "previous" param:
+ *   0 = current season, 1 = last season, 2 = oldest season.
+ * season_index is always written explicitly so historical rows land in the
+ * right bucket regardless of DB defaults or rollover state.
  */
-async function upsertMatch(match, competitionId, roundId, roundTimeStr) {
+async function upsertMatch(match, competitionId, roundId, roundTimeStr, seasonIndex = 0) {
   const { error } = await supabase
     .from('matches')
     .upsert({
@@ -313,6 +342,7 @@ async function upsertMatch(match, competitionId, roundId, roundTimeStr) {
       ht_away_corners:     match.halfTimeAwayCornerScore ?? 0,
       corner_minutes_home: match.minuteCornerHome ?? null,
       corner_minutes_away: match.minuteCornerAway ?? null,
+      season_index:        seasonIndex,
       status:              'completed',
       updated_at:          new Date().toISOString(),
     }, { onConflict: 'match_id' });
@@ -386,6 +416,37 @@ async function upsertStanding(standing, competitionId) {
       updated_at:     new Date().toISOString(),
     }, { onConflict: 'competition_id,team_id' });
   if (error) throw new Error(`upsertStanding(${standing.competitorId}): ${error.message}`);
+}
+
+/**
+ * Upsert a historical standings row into standings_history.
+ * seasonIndex: 1 = last season, 2 = oldest season.
+ *
+ * Requires a unique constraint on (competition_id, team_id, season_index).
+ * If missing, run once in Supabase SQL editor:
+ *   ALTER TABLE standings_history
+ *     ADD CONSTRAINT standings_history_comp_team_season_key
+ *     UNIQUE (competition_id, team_id, season_index);
+ */
+async function upsertStandingHistory(standing, competitionId, seasonIndex) {
+  const { error } = await supabase
+    .from('standings_history')
+    .upsert({
+      competition_id: competitionId,
+      team_id:        standing.competitorId,
+      season_index:   seasonIndex,
+      position:       standing.position,
+      points:         standing.points,
+      played:         standing.played,
+      wins:           standing.wins,
+      draws:          standing.draws,
+      losses:         standing.loses,
+      goals_for:      standing.goalsFor,
+      goals_against:  standing.goalsAgainst,
+      form:           standing.form ?? [],
+      updated_at:     new Date().toISOString(),
+    }, { onConflict: 'competition_id,team_id,season_index' });
+  if (error) throw new Error(`upsertStandingHistory(${standing.competitorId}, s${seasonIndex}): ${error.message}`);
 }
 
 /**
@@ -636,24 +697,161 @@ async function syncLeaguesAndTeams() {
   return competitions;
 }
 
-/** Scrape completed match results for all competitions. */
+/**
+ * Archive all season data for one competition from one season slot to another.
+ *
+ * Called when a season rollover is detected: the data currently stored as
+ * season_index=1 (Previous) must be moved to season_index=2 (Oldest) before
+ * it gets overwritten by the incoming new previous season.
+ *
+ * Steps:
+ *   1. Fetch and save the fresh previous=1 standings from the API into
+ *      standings_history(1) — this gives us the most up-to-date snapshot
+ *      of Season B's final table before it slides away from the API.
+ *   2. Delete any existing season_index=toSeason rows (clean slate).
+ *   3. Move season_index=fromSeason rows → season_index=toSeason.
+ *
+ * match_id values are unique across all seasons in virtual football, so
+ * UPDATE … SET season_index=2 never causes a conflict on the matches table.
+ * standings_history requires deleting toSeason rows first because of the
+ * UNIQUE(competition_id, team_id, season_index) constraint.
+ */
+async function archiveSeasonForComp(competitionId, compName, fromSeason, toSeason) {
+  // NOTE: syncStandings already ran this cycle and saved the latest previous=1
+  // standings into standings_history(1). No need to snapshot again here —
+  // doing so risks re-fetching after the API has already flipped to the new season.
+
+  // Move matches fromSeason → toSeason ────────────────────────────────────
+  const { error: delMatchErr } = await supabase
+    .from('matches')
+    .delete()
+    .eq('competition_id', competitionId)
+    .eq('season_index', toSeason);
+  if (delMatchErr) throw new Error(`archiveSeasonForComp del matches: ${delMatchErr.message}`);
+
+  const { error: updMatchErr } = await supabase
+    .from('matches')
+    .update({ season_index: toSeason, updated_at: new Date().toISOString() })
+    .eq('competition_id', competitionId)
+    .eq('season_index', fromSeason);
+  if (updMatchErr) throw new Error(`archiveSeasonForComp upd matches: ${updMatchErr.message}`);
+
+  // Step 2 + 3: Move standings_history fromSeason → toSeason ───────────────
+  const { error: delStErr } = await supabase
+    .from('standings_history')
+    .delete()
+    .eq('competition_id', competitionId)
+    .eq('season_index', toSeason);
+  if (delStErr) throw new Error(`archiveSeasonForComp del standings_history: ${delStErr.message}`);
+
+  const { error: updStErr } = await supabase
+    .from('standings_history')
+    .update({ season_index: toSeason, updated_at: new Date().toISOString() })
+    .eq('competition_id', competitionId)
+    .eq('season_index', fromSeason);
+  if (updStErr) throw new Error(`archiveSeasonForComp upd standings_history: ${updStErr.message}`);
+
+  console.log(`[archive] ${compName}: archived season ${fromSeason} → ${toSeason}.`);
+}
+
+/**
+ * Scrape completed match results for all competitions.
+ *
+ * Season model (Zoom API only exposes 2 seasons — previous=0 and previous=1):
+ *   season_index 0 = current season       ← previous=0 from API, refreshed every cycle
+ *   season_index 1 = previous season      ← previous=1 from API
+ *   season_index 2 = oldest season (Oldest tab) ← NOT on the API; lives only in our DB.
+ *                    Populated by archiving season_index=1 when a new season starts.
+ *
+ * Rollover detection (per competition, no in-process state needed):
+ *   Sample up to 20 match IDs from the incoming previous=1 response.
+ *   If NONE of them exist in our DB as season_index=1 for this competition,
+ *   the API has rolled to a new season. We archive the old 1→2 before writing.
+ *
+ * This approach is fully self-healing on every scrape cycle: process restarts,
+ * partial failures, and missed cycles all recover automatically.
+ */
 async function scrapeResults(competitions) {
   let totalMatches = 0;
   let totalGoals   = 0;
 
   for (const comp of competitions) {
     try {
-      const rounds = await fetchAllResults(comp.id);
-      for (const round of rounds) {
+      // ── Previous season (previous=1 → season_index 1) ─────────────────
+      const prevRounds = await fetchAllResults(comp.id, 1);
+
+      if (prevRounds.length > 0) {
+        // Rollover detection: sample incoming match IDs against the DB.
+        const sampleIds = prevRounds
+          .flatMap(r => (r.matches ?? []).map(m => m.matchId))
+          .slice(0, 20);
+
+        // Two-part rollover check:
+        // (a) None of the incoming previous=1 match IDs exist in DB season_index=1.
+        // (b) DB season_index=1 already has substantial data (≥ 50 matches).
+        //     This prevents a false trigger on first run / cold start / partial
+        //     prior cycle — all of which would leave season_index=1 empty, causing
+        //     the sample to return 0 matches even though nothing rolled over.
+        //     A false trigger would delete the existing season_index=2 (Oldest) data.
+        const { data: existing, error: chkErr } = await supabase
+          .from('matches')
+          .select('match_id')
+          .in('match_id', sampleIds)
+          .eq('competition_id', comp.id)
+          .eq('season_index', 1)
+          .limit(1);
+
+        if (chkErr) throw chkErr;
+
+        const { count: s1Count, error: cntErr } = await supabase
+          .from('matches')
+          .select('match_id', { count: 'exact', head: true })
+          .eq('competition_id', comp.id)
+          .eq('season_index', 1);
+
+        if (cntErr) throw cntErr;
+
+        const noOverlap      = sampleIds.length > 0 && (existing ?? []).length === 0;
+        const hasEnoughData  = (s1Count ?? 0) >= 50; // a real full season has many more
+        const isRollover     = noOverlap && hasEnoughData;
+
+        if (isRollover) {
+          // The API's previous=1 is a brand-new season — the old previous
+          // season is no longer accessible via the API after this cycle.
+          // Archive season_index=1 → season_index=2 NOW before overwriting.
+          console.log(`[scraper] Season rollover detected for ${comp.name} — archiving 1 → 2.`);
+          await archiveSeasonForComp(comp.id, comp.name, 1, 2);
+        }
+
+        // Write incoming previous=1 data as season_index=1.
+        // Goal events are included — the Zoom API returns goalscorer data for
+        // previous=1 too, and upsertGoalEvents uses ignoreDuplicates:true so
+        // re-inserting already-known events is a harmless no-op.
+        // This ensures leagues that were never rolled over (first run of this fix)
+        // get full scorer+minute data for all their season-1 matches.
+        for (const round of prevRounds) {
+          for (const match of round.matches ?? []) {
+            await upsertMatch(match, comp.id, round.id, round.time, 1);
+            await upsertGoalEvents(match.matchId, match.goalscorersHome, 'home');
+            await upsertGoalEvents(match.matchId, match.goalscorersAway, 'away');
+            totalMatches++;
+            totalGoals += (match.homeScore ?? 0) + (match.awayScore ?? 0);
+          }
+        }
+        console.log(`[scraper] ${comp.name} season 1: ${prevRounds.length} rounds scraped.`);
+      }
+
+      // ── Current season (previous=0 → season_index 0) ──────────────────
+      const currRounds = await fetchAllResults(comp.id, 0);
+
+      for (const round of currRounds) {
         for (const match of round.matches ?? []) {
-          await upsertMatch(match, comp.id, round.id, round.time);
+          await upsertMatch(match, comp.id, round.id, round.time, 0);
           await upsertGoalEvents(match.matchId, match.goalscorersHome, 'home');
           await upsertGoalEvents(match.matchId, match.goalscorersAway, 'away');
 
-          // FIX: Build H2H immediately from match data so records are saved even
-          // when the stats window closes before sweepMissingStats runs.
-          // Possession fields start null; sweepMissingStats fills them in via upsert
-          // when stats become available.
+          // Build H2H immediately so records are saved even when the stats
+          // window closes before sweepMissingStats runs.
           await buildAndUpsertH2H(match, round.time, null).catch(err =>
             console.error(`[h2h] scrapeResults error (match ${match.matchId}): ${err.message}`)
           );
@@ -663,37 +861,81 @@ async function scrapeResults(competitions) {
         }
       }
 
-      if (rounds.length > 0) {
-        const latestRoundId = rounds[0].id;
+      if (currRounds.length > 0) {
+        const latestRoundId = currRounds[0].id;
         const prevMax       = allTimeMaxRound.get(comp.id) ?? 0;
         if (latestRoundId > prevMax) allTimeMaxRound.set(comp.id, latestRoundId);
+        console.log(`[scraper] ${comp.name} season 0: ${currRounds.length} rounds scraped.`);
       }
 
-      console.log(`[scraper] ${comp.name}: ${rounds.length} rounds scraped.`);
     } catch (err) {
       console.error(`[scraper] Results error (comp ${comp.id}): ${err.message}`);
     }
   }
+
   console.log(`[scraper] Results done — ${totalMatches} matches, ${totalGoals} goals total.`);
 }
 
-/** Sync standings for all competitions — pure upsert, no rollover logic (handled separately). */
+/**
+ * Sync standings for all competitions.
+ *
+ * Current season  → `standings` table (live, always overwritten).
+ * Previous season → `standings_history` season_index=1.
+ *
+ * NOTE: syncStandings runs BEFORE scrapeResults in runSlowCycle so that the
+ * standings for the old season are captured into standings_history(1) BEFORE
+ * scrapeResults potentially archives them to standings_history(2).
+ *
+ * Guard: if the Statistics endpoint ignores `previous` and returns current-
+ * season data, the played totals will be close. Skip the write if they're
+ * within 5% of each other to prevent data corruption.
+ */
 async function syncStandings(competitions) {
   let totalRows = 0;
 
   for (const comp of competitions) {
     try {
-      const rows = await fetchStandings(comp.id);
-      if (!rows || rows.length === 0) continue;
-      for (const row of rows) {
+      // ── Current season → standings table ────────────────────────────────
+      const currRows = await fetchStandings(comp.id);
+      if (!currRows || currRows.length === 0) continue;
+      const currPlayedTotal = currRows.reduce((s, r) => s + (r.played ?? 0), 0);
+
+      for (const row of currRows) {
         await upsertStanding(row, comp.id);
         totalRows++;
       }
-      console.log(`[scraper] ${comp.name}: ${rows.length} standing rows upserted.`);
+
+      // ── Previous season → standings_history(1) ───────────────────────────
+      try {
+        const prevRows = await fetchStandingsForSeason(comp.id, 1);
+        if (!prevRows || prevRows.length === 0) continue;
+
+        const prevPlayedTotal = prevRows.reduce((s, r) => s + (r.played ?? 0), 0);
+
+        // Guard: skip if the API returned identical data to current season.
+        if (prevPlayedTotal > 0 && currPlayedTotal > 0 &&
+            Math.abs(prevPlayedTotal - currPlayedTotal) / currPlayedTotal < 0.05) {
+          console.warn(
+            `[scraper] ${comp.name} previous standings look same as current ` +
+            `(played ${prevPlayedTotal} vs ${currPlayedTotal}) — skipping history write.`
+          );
+          continue;
+        }
+
+        for (const row of prevRows) {
+          await upsertStandingHistory(row, comp.id, 1);
+          totalRows++;
+        }
+        console.log(`[scraper] ${comp.name} season 1 standings: ${prevRows.length} rows saved to history.`);
+      } catch (err) {
+        console.warn(`[scraper] ${comp.name} previous standings skipped: ${err.message}`);
+      }
+
     } catch (err) {
       console.error(`[scraper] Standings error (comp ${comp.id}): ${err.message}`);
     }
   }
+
   console.log(`[scraper] Standings done — ${totalRows} rows total.`);
 }
 
@@ -850,9 +1092,10 @@ async function runSlowCycle() {
   console.log(`\n${label} === Slow cycle start ${new Date().toISOString()} ===`);
   try {
     cachedCompetitions = await syncLeaguesAndTeams();
-    await checkRolloversBeforeScrape(cachedCompetitions);
-    await scrapeResults(cachedCompetitions);
+    // syncStandings runs FIRST so standings_history(1) is populated before
+    // scrapeResults may archive it to standings_history(2) on rollover.
     await syncStandings(cachedCompetitions);
+    await scrapeResults(cachedCompetitions);
     await sweepMissingStats(cachedCompetitions);
     console.log(`${label} === Slow cycle complete ===`);
   } catch (err) {
