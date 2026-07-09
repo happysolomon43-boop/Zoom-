@@ -864,14 +864,27 @@ async function scrapeResults(competitions, fullSync = false) {
           allTimeMaxRound.set(comp.id, 0);
         }
 
-        if (fullSync) {
+        // BUG FIX: previously season_index=1 was only (re)written on a
+        // fullSync (startup). A rollover detected mid-session on a routine
+        // cycle archived 1→2 correctly but left season_index=1 EMPTY until
+        // the next process restart — which, on a long-lived Render instance,
+        // could be hours. Users saw a blank "Previous" tab right after every
+        // real rollover. On a rollover during a routine cycle, fetch the full
+        // previous-season data now (the 3-round probe above isn't enough)
+        // and write it immediately, same as the fullSync path.
+        const needsSeason1Write = fullSync || isRollover;
+        const season1Rounds = fullSync
+          ? prevRounds
+          : (isRollover ? await fetchAllResults(comp.id, 1) : []);
+
+        if (needsSeason1Write) {
           // Write incoming previous=1 data as season_index=1.
           // Goal events are included — the Zoom API returns goalscorer data for
           // previous=1 too, and upsertGoalEvents uses ignoreDuplicates:true so
           // re-inserting already-known events is a harmless no-op.
           // This ensures leagues that were never rolled over (first run of this fix)
           // get full scorer+minute data for all their season-1 matches.
-          for (const round of prevRounds) {
+          for (const round of season1Rounds) {
             for (const match of round.matches ?? []) {
               await upsertMatch(match, comp.id, round.id, round.time, 1);
               await upsertGoalEvents(match.matchId, match.goalscorersHome, 'home');
@@ -880,7 +893,7 @@ async function scrapeResults(competitions, fullSync = false) {
               totalGoals += (match.homeScore ?? 0) + (match.awayScore ?? 0);
             }
           }
-          console.log(`[scraper] ${comp.name} season 1: ${prevRounds.length} rounds scraped.`);
+          console.log(`[scraper] ${comp.name} season 1: ${season1Rounds.length} rounds scraped.`);
         }
       }
 

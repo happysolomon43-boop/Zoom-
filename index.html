@@ -987,6 +987,39 @@ function switchTab(tab) {
   activeTab = tab;
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + tab));
+  restartTabAutoRefresh();
+}
+
+// ── Tab auto-refresh ─────────────────────────────────────────────────────
+// FIX: only the Live tab auto-refreshed (every 30s). Results and Standings
+// never refreshed on their own — the moment a round finished, nothing on
+// screen changed until the user manually switched tabs or reloaded the
+// page, which looked like "updates take minutes" even when the backend had
+// already written the new round seconds earlier. Poll whichever tab is
+// currently visible so a finished round shows up within one interval.
+const TAB_REFRESH_MS = 20000; // matches the backend fast-cycle cadence
+let resultsTimer = null;
+let standingsTimer = null;
+
+function restartTabAutoRefresh() {
+  clearInterval(resultsTimer);
+  clearInterval(standingsTimer);
+  resultsTimer = null;
+  standingsTimer = null;
+
+  if (activeTab === 'results') {
+    // Only auto-refresh the live "current season" results feed in the
+    // default league grouping — previous/oldest seasons are historical and
+    // don't change, and a live head-to-head/round lookup shouldn't have its
+    // scroll position reset out from under the user every 20s.
+    if (groupMode === 'league' && Number(resultsSeason) === 0) {
+      resultsTimer = setInterval(() => loadResults(true), TAB_REFRESH_MS);
+    } else if (groupMode === 'round' && Number(resultsSeason) === 0) {
+      resultsTimer = setInterval(() => loadRoundResults(), TAB_REFRESH_MS);
+    }
+  } else if (activeTab === 'standings') {
+    standingsTimer = setInterval(() => loadStandings(), TAB_REFRESH_MS);
+  }
 }
 
 // ── League chips (Live / Results-League / Results-Round) ───────────────
@@ -1218,6 +1251,7 @@ function wireResultsControls() {
       dateFrom = null; dateTo = null;
       renderResultsContext();
       loadResults(true);
+      restartTabAutoRefresh(); // groupMode affects auto-refresh eligibility
     });
   });
 
@@ -1227,6 +1261,7 @@ function wireResultsControls() {
       document.querySelectorAll('#resultsSeasonToggle button').forEach(b => b.classList.toggle('active', b === btn));
       currentRoundId = null;
       loadResults(true);
+      restartTabAutoRefresh(); // resultsSeason affects auto-refresh eligibility
     });
   });
 }
