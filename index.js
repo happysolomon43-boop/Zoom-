@@ -871,6 +871,17 @@ const app = express();
 app.use(express.json());
 app.set('json spaces', 2);
 
+// CORS: this API is read-open by design (no auth on GET routes — see header
+// comment), so allowing any origin matches the existing security model.
+// DELETE routes stay protected by X-Api-Key regardless of origin.
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, X-Api-Key');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 function asyncHandler(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 }
