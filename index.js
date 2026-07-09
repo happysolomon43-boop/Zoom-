@@ -215,9 +215,13 @@ async function fetchAllResults(competitionId, previous = 0) {
     }
     if (!data || !data.rounds || data.rounds.length === 0) break;
     allRounds.push(...data.rounds);
-    const total = data.total_rounds ?? data.rounds.length;
     offset += data.rounds.length;
-    if (offset >= total || data.rounds.length < limit) break;
+    // FIX: removed `data.total_rounds ?? data.rounds.length` fallback.
+    // When the API omits total_rounds it fell back to the page size (100),
+    // so offset (100) >= total (100) broke after the first page — silently
+    // capping every league at 100 rounds. After ~16 hours Premier Turbo
+    // crosses 100 rounds; new rounds live on page 2+ and were never fetched.
+    if (data.rounds.length < limit) break;
   }
   return allRounds;
 }
@@ -770,14 +774,22 @@ async function archiveSeasonForComp(competitionId, compName, fromSeason, toSeaso
  * This approach is fully self-healing on every scrape cycle: process restarts,
  * partial failures, and missed cycles all recover automatically.
  */
-async function scrapeResults(competitions) {
+/**
+ * FIX: recentOnly=true (routine 5-min cycles) fetches only the last
+ * STATS_SWEEP_ROUNDS rounds per league instead of ALL historical rounds.
+ * Full history (recentOnly=false) runs once at startup and is self-healing
+ * for cold starts. Re-fetching thousands of rounds every 5 min was making
+ * slow cycles take many minutes and was the second cause of stale data.
+ */
+async function scrapeResults(competitions, recentOnly = false) {
   let totalMatches = 0;
   let totalGoals   = 0;
 
   for (const comp of competitions) {
     try {
       // ── Previous season (previous=1 → season_index 1) ─────────────────
-      const prevRounds = await fetchAllResults(comp.id, 1);
+      // Skip on routine cycles — previous season data doesn't change often.
+      const prevRounds = recentOnly ? [] : await fetchAllResults(comp.id, 1);
 
       if (prevRounds.length > 0) {
         // Rollover detection: sample incoming match IDs against the DB.
@@ -841,7 +853,9 @@ async function scrapeResults(competitions) {
       }
 
       // ── Current season (previous=0 → season_index 0) ──────────────────
-      const currRounds = await fetchAllResults(comp.id, 0);
+      const currRounds = recentOnly
+        ? await fetchRecentRounds(comp.id, STATS_SWEEP_ROUNDS)
+        : await fetchAllResults(comp.id, 0);
 
       for (const round of currRounds) {
         for (const match of round.matches ?? []) {
@@ -1137,20 +1151,20 @@ let cachedCompetitions = [];
 let slowInFlight = false;
 let fastInFlight = false;
 
-async function runSlowCycle() {
+async function runSlowCycle(recentOnly = true) {
   if (slowInFlight) {
     console.warn('[scraper][slow] Previous cycle still running — skipping this tick.');
     return;
   }
   slowInFlight = true;
   const label = '[scraper][slow]';
-  console.log(`\n${label} === Slow cycle start ${new Date().toISOString()} ===`);
+  console.log(`\n${label} === Slow cycle start ${new Date().toISOString()} (recentOnly=${recentOnly}) ===`);
   try {
     cachedCompetitions = await syncLeaguesAndTeams();
     // syncStandings runs FIRST so standings_history(1) is populated before
     // scrapeResults may archive it to standings_history(2) on rollover.
     await syncStandings(cachedCompetitions);
-    await scrapeResults(cachedCompetitions);
+    await scrapeResults(cachedCompetitions, recentOnly);
     await sweepMissingStats(cachedCompetitions);
     console.log(`${label} === Slow cycle complete ===`);
   } catch (err) {
@@ -1550,7 +1564,7 @@ app.listen(PORT, () => {
     // retry on their normal schedule — no permanent dead-end.
     try {
       await initRolloverTracking();
-      await runSlowCycle();
+      await runSlowCycle(false); // false = full history fetch on startup
       console.log('[scraper] Initial run complete. Running on schedule...');
     } catch (err) {
       console.error(`[scraper] Initial run failed (will retry on next 5-min tick): ${err.message}`);
