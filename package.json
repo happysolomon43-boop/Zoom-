@@ -1,0 +1,19 @@
+{
+  "name": "zoom-scores-scraper",
+  "version": "1.0.0",
+  "description": "Sports data scraper + API for Zoom Scores (Bet9ja)",
+  "main": "index.js",
+  "scripts": {
+    "scraper": "node scraper.js",
+    "server": "node index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.50.0",
+    "express": "^4.21.2",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
