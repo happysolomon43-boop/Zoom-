@@ -754,14 +754,26 @@ async function sweepMissingStats(competitions) {
   }
 }
 
-/** Scrape live matches for all competitions that have a live round. */
+/**
+ * Scrape live matches for all competitions.
+ *
+ * IMPORTANT: this intentionally does NOT pre-filter competitions using the
+ * `liveRound` field from /Competition/Init. That field comes from the same
+ * infrequently-refreshed competitions list used for league/team sync, and
+ * there's no guarantee it's updated on the same cadence as a round actually
+ * going live. Gating on it silently skipped competitions whenever the field
+ * was stale or unset, which was making the /live endpoint (and the app's
+ * Live tab) look empty even while rounds were genuinely in progress.
+ * fetchLiveResults() already returns null when nothing is live for a given
+ * competition — that's the real source of truth — so every competition is
+ * checked every fast cycle and the null/empty result is what determines
+ * "nothing live," not a possibly-stale flag.
+ */
 async function scrapeLive(competitions) {
-  const liveComps = competitions.filter(c => c.liveRound != null && c.liveRound > 0);
-
   let liveCount      = 0;
   const seenMatchIds = new Set();
 
-  for (const comp of liveComps) {
+  for (const comp of competitions) {
     try {
       const liveData = await fetchLiveResults(comp.id);
       if (!liveData) continue;

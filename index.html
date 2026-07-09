@@ -470,6 +470,23 @@
 
   .no-detail { color: var(--text-faint); font-size: 12px; padding: 8px 0; }
 
+  .h2h-count { color: var(--text-faint); font-weight: 400; text-transform: none; letter-spacing: normal; font-family: var(--font-mono); }
+  .h2h-row {
+    display: grid;
+    grid-template-columns: 40px 1fr auto 1fr;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 0;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .h2h-row + .h2h-row { border-top: 1px solid var(--border); }
+  .h2h-date { font-family: var(--font-mono); font-size: 10px; color: var(--text-faint); }
+  .h2h-team { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .h2h-team:last-child { text-align: right; }
+  .h2h-team.winner { color: var(--text); font-weight: 600; }
+  .h2h-score { font-family: var(--font-mono); font-weight: 700; color: var(--text); padding: 0 4px; white-space: nowrap; }
+
   .load-more-btn {
     display: block;
     width: 100%;
@@ -829,7 +846,7 @@ function renderLive(matches) {
 
   if (!hasLive) {
     el.innerHTML = '<div class="empty-state"><div class="headline">Nothing live right now</div>' +
-      '<div class="sub">Virtual rounds finish in minutes, so this fills and empties fast — check back shortly.</div></div>';
+      '<div class="sub">No round is currently in progress for this selection. This refreshes automatically every 30 seconds.</div></div>';
     return;
   }
 
@@ -972,7 +989,7 @@ function renderMatchRow(m) {
   const awayName = m.away_team?.name ?? ('Team ' + m.away_team_id);
   const homeWin = (m.home_score ?? 0) > (m.away_score ?? 0);
   const awayWin = (m.away_score ?? 0) > (m.home_score ?? 0);
-  return '<div class="match-row" data-match-id="' + m.match_id + '">' +
+  return '<div class="match-row" data-match-id="' + m.match_id + '" data-home-team-id="' + m.home_team_id + '" data-away-team-id="' + m.away_team_id + '">' +
     '<div class="match-row-main">' +
       '<div class="match-date">' + fmtDate(m.round_time) + '</div>' +
       '<div class="match-teams">' +
@@ -991,21 +1008,25 @@ function wireMatchRows() {
     row.querySelector('.match-row-main').addEventListener('click', () => {
       const wasOpen = row.classList.contains('open');
       row.classList.toggle('open', !wasOpen);
-      if (!wasOpen) loadMatchDetail(row.dataset.matchId);
+      if (!wasOpen) loadMatchDetail(row.dataset.matchId, row.dataset.homeTeamId, row.dataset.awayTeamId);
     });
   });
 }
 
-async function loadMatchDetail(matchId) {
+async function loadMatchDetail(matchId, homeTeamId, awayTeamId) {
   const container = document.getElementById('detail-' + matchId);
   if (matchDetailCache[matchId]) { renderMatchDetail(container, matchDetailCache[matchId]); return; }
 
   try {
-    const [goals, statsRes] = await Promise.all([
+    const [goals, statsRes, h2hRes] = await Promise.all([
       api('/matches/' + matchId + '/goals'),
       api('/matches/' + matchId + '/stats').catch(() => null),
+      (homeTeamId && awayTeamId)
+        ? api('/head-to-head?homeTeamId=' + homeTeamId + '&awayTeamId=' + awayTeamId).catch(() => null)
+        : Promise.resolve(null),
     ]);
-    const detail = { goals: goals || [], stats: statsRes };
+    const h2h = (h2hRes?.records || []).filter(r => String(r.reference_match_id) !== String(matchId));
+    const detail = { goals: goals || [], stats: statsRes, h2h };
     matchDetailCache[matchId] = detail;
     renderMatchDetail(container, detail);
   } catch (err) {
@@ -1035,6 +1056,25 @@ function renderMatchDetail(container, detail) {
   } else {
     html += '<div class="no-detail">No possession/stats recorded for this match.</div>';
   }
+
+  html += '<div class="detail-section"><div class="detail-label">Head-to-Head' + (detail.h2h && detail.h2h.length ? ' <span class="h2h-count">(' + detail.h2h.length + ')</span>' : '') + '</div>';
+  if (detail.h2h && detail.h2h.length > 0) {
+    detail.h2h.forEach(r => {
+      const homeName = r.home_team?.name ?? ('Team ' + r.home_team_id);
+      const awayName = r.away_team?.name ?? ('Team ' + r.away_team_id);
+      const homeWin = (r.home_score ?? 0) > (r.away_score ?? 0);
+      const awayWin = (r.away_score ?? 0) > (r.home_score ?? 0);
+      html += '<div class="h2h-row">' +
+        '<span class="h2h-date">' + fmtDate(r.match_start_time) + '</span>' +
+        '<span class="h2h-team' + (homeWin ? ' winner' : '') + '">' + escapeHtml(homeName) + '</span>' +
+        '<span class="h2h-score">' + (r.home_score ?? 0) + '–' + (r.away_score ?? 0) + '</span>' +
+        '<span class="h2h-team' + (awayWin ? ' winner' : '') + '">' + escapeHtml(awayName) + '</span>' +
+      '</div>';
+    });
+  } else {
+    html += '<div class="no-detail">No previous meetings on record.</div>';
+  }
+  html += '</div>';
 
   container.innerHTML = html || '<div class="no-detail">No additional detail for this match.</div>';
 }
