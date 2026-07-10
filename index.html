@@ -2071,7 +2071,27 @@ async function doExport(format, scope = 2) {
     }
 
     function renderPy() {
-      return renderTxt();
+      // Wrap the shared raw-text body inside the scemd/match_data/match.py
+      // template: LEAGUE_ID / REFERENCE_DATE / RAW_TEXT triple-quoted blob.
+      // Order matters: escape backslashes FIRST (so Python's string parser
+      // doesn't interpret e.g. a literal "\n" or "\t" inside the data as a
+      // real escape sequence and corrupt it), THEN escape any literal
+      // triple-quote runs so they can't prematurely close the string.
+      const body = renderTxt()
+        .replace(/\\/g, '\\\\')
+        .replace(/"""/g, '\\"\\"\\"');
+      return [
+        'from datetime import datetime',
+        '',
+        'LEAGUE_ID: str = "' + leagueName.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"',
+        '',
+        'REFERENCE_DATE: datetime = datetime.now()',
+        '',
+        'RAW_TEXT: str = """',
+        body,
+        '"""',
+        '',
+      ].join('\n');
     }
 
     // ── 7. Dispatch & download ──────────────────────────────────────────
@@ -2084,7 +2104,7 @@ async function doExport(format, scope = 2) {
     const url      = URL.createObjectURL(blob);
     const a        = document.createElement('a');
     a.href         = url;
-    a.download     = fileBase + '.' + format;
+    a.download     = format === 'py' ? 'match.py' : (fileBase + '.' + format);
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
