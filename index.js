@@ -165,6 +165,20 @@ function fetchWithTimeout(url, options) {
     .finally(() => clearTimeout(timer));
 }
 
+// TEMPORARY DIAGNOSTIC: the user reports all 9 leagues run continuously with
+// no gaps between rounds, yet fetchLiveResults has returned "nothing live"
+// (status!==1, code -24142/-24499) for every single call across a 45-minute
+// window with zero errors and zero shape-mismatches — meaning the null path
+// is firing 100% of the time despite matches genuinely being in progress on
+// the real site. That's consistent with the Zoom API silently returning a
+// synthetic "not live" response to a caller it doesn't trust (Render's IP),
+// rather than an honest error. Log the raw status/error every time a
+// LiveResults call resolves to the null branch, gated behind an env var, so
+// we can see the exact code/message being returned instead of guessing.
+// Set DEBUG_LIVE_RESULTS=1 in Render's environment, redeploy, capture a
+// couple of these lines, then unset it — this is not meant to run long-term.
+const DEBUG_LIVE_RESULTS = process.env.DEBUG_LIVE_RESULTS === '1';
+
 async function zoomGet(path) {
   const url = `${ZOOM_BASE}${path}`;
   const res = await fetchWithTimeout(url, { headers: ZOOM_HEADERS });
@@ -173,8 +187,16 @@ async function zoomGet(path) {
   if (body.status !== 1) {
     const code = body.error?.code;
     // -24142 = match not in progress  -24499 = no data / invalid state
-    if (code === -24142 || code === -24499) return null;
+    if (code === -24142 || code === -24499) {
+      if (DEBUG_LIVE_RESULTS && path.includes('LiveResults')) {
+        console.log(`[DEBUG-LIVE] ${path} → status=${body.status} code=${code} message=${body.error?.message ?? '(none)'} raw=${JSON.stringify(body).slice(0, 300)}`);
+      }
+      return null;
+    }
     throw new Error(`GET ${path} → API error ${code}: ${body.error?.message}`);
+  }
+  if (DEBUG_LIVE_RESULTS && path.includes('LiveResults')) {
+    console.log(`[DEBUG-LIVE] ${path} → status=1 (success) data keys=${JSON.stringify(Object.keys(body.data ?? {}))}`);
   }
   return body.data;
 }
@@ -872,10 +894,21 @@ async function scrapeResults(competitions, fullSync = false) {
         // real rollover. On a rollover during a routine cycle, fetch the full
         // previous-season data now (the 3-round probe above isn't enough)
         // and write it immediately, same as the fullSync path.
-        const needsSeason1Write = fullSync || isRollover;
+        //
+        // Self-healing: also backfill whenever the DB currently has ZERO
+        // season_index=1 rows for this competition, even if isRollover
+        // didn't fire this tick. This covers the case where a rollover was
+        // detected and archived successfully on an earlier cycle but the
+        // immediate backfill fetch/write failed partway through (network
+        // blip, timeout) — without this, season_index=1 would otherwise stay
+        // stuck at 0 forever, since a fresh rollover can't be re-detected
+        // once season_index=1 is already empty (hasEnoughData requires ≥50
+        // existing rows to guard against false triggers).
+        const needsSeason1Backfill = isRollover || (s1Count ?? 0) === 0;
+        const needsSeason1Write = fullSync || needsSeason1Backfill;
         const season1Rounds = fullSync
           ? prevRounds
-          : (isRollover ? await fetchAllResults(comp.id, 1) : []);
+          : (needsSeason1Backfill ? await fetchAllResults(comp.id, 1) : []);
 
         if (needsSeason1Write) {
           // Write incoming previous=1 data as season_index=1.
